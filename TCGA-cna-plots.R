@@ -11,13 +11,13 @@ source("/mnt/AchTeraD/Documents/R-functions/save_and_plot.R")
 nthreads = 40
 
 # Load and list files
-clinical = readRDS("/mnt/AchTeraD/Documents/Projects/ijms_review/data/clinical.rds")
-tss = fread("/mnt/AchTeraD/Documents/Projects/ijms_review/data/tcga-tss-codetable-abb.tsv")
+clinical = readRDS("/mnt/AchTeraD/Documents/Projects/cna_review/data/clinical.rds")
+tss = fread("/mnt/AchTeraD/Documents/Projects/cna_review/data/tcga-tss-codetable-abb.tsv")
 chr_annot = fread("/mnt/AchTeraD/Documents/Projects/scCUTseq/data/hg19_chromosomal_arms.bed")
-cosmic = fread("/mnt/AchTeraD/Documents/Projects/ijms_review/data/cosmic/gene-census.tsv")
-number = fread("/mnt/AchTeraD/Documents/Projects/ijms_review/data/number-of-samples.tsv")
+cosmic = fread("/mnt/AchTeraD/Documents/Projects/cna_review/data/cosmic/gene-census.tsv")
+number = fread("/mnt/AchTeraD/Documents/Projects/cna_review/data/number-of-samples.tsv")
 
-files = list.files("/mnt/AchTeraD/Documents/Projects/ijms_review/data/tcga-cnv-log2/", 
+files = list.files("/mnt/AchTeraD/Documents/Projects/cna_review/data/tcga-cnv-log2/", 
                    recursive = T, full.names = TRUE, pattern = ".txt$")
 files = files[!grepl("annotation", files)]
 
@@ -138,8 +138,8 @@ plt1 = ggplot(alt_types_subtype, aes(x = `Study Abbreviation`, y = percentage, f
   labs(y = "Proportion of alteration type (%)", x = "Tumor type", fill = "Alteration type") +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-save_and_plot(plt1, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/proportion-of-alteration-types",
-              width = 14, height = 8)
+# save_and_plot(plt1, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/proportion-of-alteration-types",
+#               width = 14, height = 8)
 
 # Plot distribution of segment lengths
 segments_cnas = result_segments[alteration_type == "cna"]
@@ -170,8 +170,8 @@ plt0 = ggplot(segments_cnas_mean, aes(x = CNA, y = Length/1e6)) +
         axis.text.x = element_blank(),
         strip.placement = "outside")
 
-save_and_plot(plt0, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/meanlength-per-tumortype",
-              width = 22, height = 8)
+# save_and_plot(plt0, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/meanlength-per-tumortype",
+#               width = 22, height = 8)
 
 segments_cnas = segments_cnas[, .(Length = mean(Length)), by = .(Chromosome, `Study Abbreviation`)]
 
@@ -185,8 +185,8 @@ geom_tile(color = "black") +
 scale_fill_viridis(begin = 0.1) +
 labs(fill = "Average normalized alteration\nlength (Mb)")
   
-save_and_plot(plt10, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/mean-alteration-length-norm",
-              width = 14, height = 8)
+# save_and_plot(plt10, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/mean-alteration-length-norm",
+#               width = 14, height = 8)
 
 
 
@@ -207,23 +207,23 @@ result_perc = merge(result_perc, barcodes[, c("portions.analytes.aliquots.aliquo
 result_perc_cor = result_perc[, .(mean_amp = mean(amp), mean_del = mean(del)), by = .(`Study Abbreviation`)]
 
 plt2 = ggplot(result_perc_cor, aes(x = mean_amp, y = mean_del)) + 
-  geom_point() +
+  geom_point(size = 4) +
   geom_smooth(method = lm, formula = y ~ x, se = F, color = "red", linetype = 2) +
-  stat_cor() +
+  stat_cor(method = "spearman", cor.coef.name = "rho") +
   labs(y = "Average percentage deleted", x = "Average percentage amplified")
 
-save_and_plot(plt2, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/correlation-mean-amp_del",
-              width = 7, height = 7)
+# save_and_plot(plt2, "/mnt/AchTeraD/Documents/Projects/cna_review/Plots/correlation-mean-amp_del-spearman",
+#               width = 7, height = 7)
 
-# # Plot scatter
-# plt2 = ggplot(result_perc, aes(x = amp, y = del)) +
-#   geom_point() +
-#   stat_cor() +
-#   geom_smooth(method = lm, formula = y ~ x, se = F, color = "red", linetype = 2) +
-#   #facet_wrap(~ `Study Abbreviation`) +
-#   labs(y = "Genome deleted (%)", x = "Genome amplified (%)")
-# 
-# save_and_plot(plt2, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/correlation-amp_del-all",
+# Plot scatter
+plt20 = ggplot(result_perc, aes(x = amp, y = del)) +
+  geom_point() +
+  stat_cor(method = "spearman", cor.coef.name = "rho") +
+  geom_smooth(method = lm, formula = y ~ x, se = F, color = "red", linetype = 2) +
+  facet_wrap(~ `Study Abbreviation`) +
+  labs(y = "Genome deleted (%)", x = "Genome amplified (%)")
+
+# save_and_plot(plt20, "/mnt/AchTeraD/Documents/Projects/cna_review/Plots/correlation-amp_del-spearman",
 #               width = 14, height = 10)
 
 
@@ -258,8 +258,8 @@ plt3 = ggplot(result_perc_m, aes(x = cna, y = value)) +
         axis.text.x = element_blank(),
         strip.placement = "outside")
 
-save_and_plot(plt3, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/Percentage-altered-dots",
-              width = 22, height = 8)
+# save_and_plot(plt3, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/Percentage-altered-dots",
+#               width = 22, height = 8)
 
 
 # Extract segment counts
@@ -306,7 +306,7 @@ plt4 = ggplot(result_events_m, aes(x = cna, y = value)) +
         axis.text.x = element_blank(),
         strip.placement = "outside")
 
-save_and_plot(plt4, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/num_events-altered-dots",
+save_and_plot(plt4, "/mnt/AchTeraD/Documents/Projects/cna_review/Plots/num_events-altered-dots",
               width = 22, height = 8)
 
 plt5 = ggplot(result_events_m, aes(x = cna, y = value)) +
@@ -326,8 +326,30 @@ plt5 = ggplot(result_events_m, aes(x = cna, y = value)) +
         axis.text.x = element_blank(),
         strip.placement = "outside")
 
-save_and_plot(plt5, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/num_events-altered-dots-2Kmax",
-              width = 22, height = 8)
+# save_and_plot(plt5, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/num_events-altered-dots-2Kmax",
+#               width = 22, height = 8)
+
+# Plot correlation for number of events
+result_events_cor = result_events[, .(mean_amp = mean(amp), mean_del = mean(del)), by = .(`Study Abbreviation`)]
+plt50 = ggplot(result_events_cor, aes(x = mean_amp, y = mean_del)) + 
+  geom_point(size = 4) +
+  geom_smooth(method = lm, formula = y ~ x, se = F, color = "red", linetype = 2) +
+  stat_cor(method = "spearman", cor.coef.name = "rho") +
+  labs(y = "Average # of Deletions", x = "Average # of Amplifications")
+
+# save_and_plot(plt50, "/mnt/AchTeraD/Documents/Projects/cna_review/Plots/correlation-mean-amp_del-events-spearman",
+#               width = 7, height = 7)
+
+# Plot scatter
+plt51 = ggplot(result_events, aes(x = amp, y = del)) +
+  geom_point() +
+  stat_cor(method = "spearman", cor.coef.name = "rho") +
+  geom_smooth(method = lm, formula = y ~ x, se = F, color = "red", linetype = 2) +
+  facet_wrap(~ `Study Abbreviation`, scales = "free") +
+  labs(y = "# of Deletions", x = "# of Amplifications")
+ 
+# save_and_plot(plt51, "/mnt/AchTeraD/Documents/Projects/cna_review/Plots/correlation-amp_del-events-spearman",
+#               width = 14, height = 10)
 
 # Get info about lengths and locations
 # Get counts per chromosome per tumor type get average counts per tumor type and chromosome
@@ -352,8 +374,8 @@ plt6 = ggplot(segment_counts, aes(x = Chromosome, fill = Chromosome, y = norm_pr
   theme(legend.position = "none",
         axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
 
-save_and_plot(plt6, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/proportion_events-chr_tumortype",
-              width = 18, height = 10)
+# save_and_plot(plt6, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/proportion_events-chr_tumortype",
+#               width = 18, height = 10)
 
 # Plot as heatmap
 plt7 = ggplot(segment_counts, aes(x = Chromosome, y = `Study Abbreviation`, fill = norm_prop *1e9)) +
@@ -361,8 +383,8 @@ plt7 = ggplot(segment_counts, aes(x = Chromosome, y = `Study Abbreviation`, fill
   labs(fill = "Proportion of total events\n(proportion / chromosome length) * 1e9") +
   scale_fill_viridis(begin = 0.1, limits = c(0, 1.5), oob = scales::squish)
 
-save_and_plot(plt7, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/proportion_events-chr_tumortype-heatmap-scale_limitedOOB",
-              width = 16, height = 10)
+# save_and_plot(plt7, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/proportion_events-chr_tumortype-heatmap-scale_limitedOOB",
+#               width = 16, height = 10)
 
 # COSMIC gene analysis
 # Set keys
@@ -398,8 +420,8 @@ plt8 = ggplot(gene_counts, aes(x = gene, y = alt_frequency, fill = `Study Abbrev
   scale_fill_manual(values = col_vector) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-save_and_plot(plt8, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/cosmic_CNAgenes-subtype-stratified",
-              width = 12, height = 8)
+# save_and_plot(plt8, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/cosmic_CNAgenes-subtype-stratified",
+#               width = 12, height = 8)
 
 gene_counts_all = result_genes[, .N, by = c("CNA", "gene")]
 gene_counts_all[, freq := N / sum(number$V1)]
@@ -417,5 +439,9 @@ plt9 = ggplot(gene_counts_all, aes(x = gene, y = freq, fill = CNA)) +
   scale_fill_brewer(palette = "Set1") +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-save_and_plot(plt9, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/cosmic_CNAgenes-total",
-              width = 12, height = 8)
+# save_and_plot(plt9, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/cosmic_CNAgenes-total",
+#               width = 12, height = 8)
+
+ggplot(iris, aes(x = Species, y = Petal.Width)) +
+  geom_boxplot() +
+  geom_jitter(width = .2) 
