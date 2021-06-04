@@ -17,11 +17,11 @@ manifest_segments = files() %>%
   filter(data_format == "txt") %>%
   manifest()
 
-# # Set cachce
-# gdc_set_cache("/mnt/AchTeraD/Documents/Projects/ijms_review/data/tcga-cnv-log2_new/")
-# 
-# # Download data to gdc_cache directory
-# download = transfer(manifest_segments$id)
+# Set cachce
+gdc_set_cache("/mnt/AchTeraD/Documents/Projects/ijms_review/data/tcga-cnv-log2_new/")
+
+# Download data to gdc_cache directory
+download = transfer(manifest_segments$id)
 
 # Get Clinical information
 case_ids = UUIDtoUUID(manifest_segments$id, to_type = "case_id")

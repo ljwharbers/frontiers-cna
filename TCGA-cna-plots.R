@@ -442,6 +442,3 @@ plt9 = ggplot(gene_counts_all, aes(x = gene, y = freq, fill = CNA)) +
 # save_and_plot(plt9, "/mnt/AchTeraD/Documents/Projects/ijms_review/Plots/cosmic_CNAgenes-total",
 #               width = 12, height = 8)
 
-ggplot(iris, aes(x = Species, y = Petal.Width)) +
-  geom_boxplot() +
-  geom_jitter(width = .2) 
