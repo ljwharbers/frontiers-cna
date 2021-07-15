@@ -1,0 +1,2321 @@
+---
+title: "Lung Cancer Project"
+author: "Federico Agostini"
+date: "11/06/2020"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+require("knitr")
+knitr::opts_chunk$set(dev='CairoPNG', dpi=300, fig_height=480, fig_width=800)
+```
+
+## Session information: {-}
+
+```{r setupEnv, include=FALSE}
+working.folder = "/home/agostif/Documents/GitHub/Lung_Cancer"
+annotation.folder = "/home/agostif/Documents/GitHub/R_Gencode_Reference"
+chip.folder = "/mnt/Storage2/ChIPseq/A549"
+hic.folder = "/mnt/Storage/HiC/A549/GGR"
+
+knitr::opts_knit$set(root.dir = working.folder)
+knitr::opts_chunk$set(echo = FALSE)
+
+setwd(working.folder)
+
+species = "Homo sapiens"
+genome = "hg19"
+version = 19
+
+# ENSEMBL annotation species
+ensembl_species = ifelse(grepl("sapiens", species), "hsapiens_gene_ensembl", "mmusculus_gene_ensembl")
+# ENSEMBL annotation repository (corresponding to version 75) 
+ensembl_annotation = ifelse(genome=="hg19", "http://feb2014.archive.ensembl.org", "http://jan2020.archive.ensembl.org")
+
+chromosomes = paste0("chr", c(1:22))
+
+annotation.folder = file.path(annotation.folder, gsub(" ", "_", species), genome)
+```
+
+```{r sessionInfo, echo=FALSE}
+cat(sessionInfo()$R.version$version.string, fill=TRUE)
+cat(paste("Platform", sessionInfo()$platform), fill=TRUE)
+cat(paste("Running under", sessionInfo()$running), fill=TRUE)
+cat(paste("Last knitted on", date()), fill=TRUE)
+cat(paste("Species: ", species), fill=TRUE)
+cat(paste("Genome assembly:", genome), fill=TRUE)
+cat(paste("Gencode version:", version), fill=TRUE)
+cat(paste("Working folder:", working.folder), fill=TRUE)
+cat(paste("Annotation folder:", annotation.folder), fill=TRUE)
+cat(paste("ChIP-seq data folder:", chip.folder), fill=TRUE)
+cat(paste("Hi-C data folder:", hic.folder), fill=TRUE)
+```
+
+```{r loadPackages, message=FALSE, results="hide", warning=FALSE}
+require("data.table")
+require("ggplot2")
+require("gridExtra")
+require("cowplot")
+require("ggpubr")
+require("ggthemes")
+require("ggsci")
+require("scales")
+require("viridis")
+require("RColorBrewer")
+require("ggrepel")
+
+require("rtracklayer")
+
+require("GenomicFeatures")
+require("AnnotationHub")
+require("biomaRt")
+
+require("fedefun")
+
+# Import Gencode pre-processed annotation files (see corresponding script) and filter objects
+load(file.path(annotation.folder, "RData", paste0(genome, "_Gencode", version, "_genes_annotations.RData")))
+genes = keepSeqlevels(genes, chromosomes, pruning.mode = "coarse")
+gene.metadata = gene.metadata[seqnames%in%chromosomes & gene_id%in%names(genes),]
+genes.pc.granges = keepSeqlevels(genes.pc.granges, chromosomes, pruning.mode = "coarse")
+```
+
+## Analysis
+
+```{r distanceProfileFunction}
+distanceToReference <- function(query, subject, width=100, fix=c("start", "end", "center"), ignore.strand=FALSE, collapse=TRUE, normType=c("none", "density", "max"), mcolsKey=NULL){
+  
+  fix = match.arg(fix)
+  normType = match.arg(normType)
+ 
+  query = resize(query, width=0, fix=fix)
+ 
+  if( !is.null(mcolsKey) ){
+    stopifnot( mcolsKey%in%colnames(mcols(query)) )
+    splitFactors = as.data.table(mcols(query))[, eval(mcolsKey), with=FALSE]
+    splitFactors = apply(splitFactors, 1, function(x) paste(gsub(" ", "", x), collapse = "_____"))
+    query = split(query, splitFactors)
+  }else{
+    query = GRangesList(query)
+  }
+  
+  res = lapply(query,
+               function(x){
+                 temp = flank(x, width=width-1, start=TRUE, both=TRUE)
+                 overlaps = as.data.table(findOverlaps(temp, subject, ignore.strand=ignore.strand, maxgap=0))
+                 toAdd = NULL
+                 if( nrow(overlaps) > 0 ){
+                   overlaps[, distance := distance(x[queryHits,], subject[subjectHits,])+1] # Count is 1-based from the TSS, which is the 0
+                   overlaps[, qStrand := as.character(strand(x[queryHits,]))]
+                   overlaps[qStrand%in%c("+", "*"), distance := ifelse(start(x[queryHits,]) > end(subject[subjectHits,]), -distance, distance)]
+                   overlaps[qStrand=="-", distance := ifelse(end(x[queryHits,]) < start(subject[subjectHits,]), -distance, distance)]
+                 }else{
+                   message("No overlaps found!")
+                   return(NULL)
+                 }
+                 
+                 result = overlaps[, .N, by=c("queryHits", "distance")]
+                 
+                 if( normType == "density" ){
+                   result[, Norm := N/sum(N), by="queryHits"]
+                 }else if( normType == "max" ){
+                   result[, Norm := N/max(N), by="queryHits"]
+                 }else{
+                   result[, Norm := N, by="queryHits"]
+                 }
+                 
+                 if( collapse == TRUE ){
+                   result = rbindlist(list(data.table(queryHits = NA, distance = seq(-width, width, 1), N = 0, Norm = rep(0, width*2+1)), result))
+                   result = result[, .(Count = sum(N), Mean = sum(Norm)/length(x), N=length(x)), by="distance"]
+                   return(result)
+                 }else{
+                   return(overlaps)
+                 }
+               })
+  if( !is.null(names(res)) ){
+    res = rbindlist(res, idcol="splitLabel")
+    res[, eval(mcolsKey) := tstrsplit(splitLabel, "_____")]
+    res[, splitLabel := NULL]
+  }else{
+    res = rbindlist(res)  
+  }
+  return(res)
+}
+
+# a = genes.pc.granges[rnaseq_gene_tpm[TPM>=1, unique(gene_id)]]
+# b = subsetByOverlaps(BLISS_data[[4]], flank(a, width = 20, start=TRUE, both = TRUE))
+# 
+# # Sanity check - global
+# g = distanceToReference(a, b, width=20, fix="start", collapse=TRUE, normType="none")[distance==0, `:=`(Count = NA, Mean = NA)]
+# ggplot(g, aes(x=distance, y=Mean)) + geom_line() + geom_point() + geom_vline(xintercept = 0, linetype="dashed", col="grey25") + theme_bw()
+# 
+# # Sanity check - individual
+# g = distanceToReference(genes.pc.granges["ENSG00000003096.9"], BLISS_data[[4]], width=10, fix="start", collapse=TRUE, normType="none")[distance!=0,] # -2, 10
+# ggplot(g, aes(x=as.factor(distance), y=Mean, group=as.factor(1))) + geom_line() + geom_point()
+# g = distanceToReference(genes["ENSG00000234524.1"], BLISS_data[[4]], width=20, fix="start", collapse=TRUE, normType="none")[distance!=0,] # -6, 18
+# ggplot(g, aes(x=as.factor(distance), y=Mean, group=as.factor(1))) + geom_line() + geom_point()
+```
+
+```{r importData}
+INFO_FC = fread("/home/agostif/Documents/GitHub/Lung_Cancer/extra/full_cohort_annotations.csv", key="Filename")
+# setkey(INFO_FC, Filename)
+INFO_BM = fread("/home/agostif/Documents/GitHub/Lung_Cancer/extra/BM_annotations_selection.tsv", key="sample_id")
+# setkey(INFO_BM, sample_id)
+
+# readRDS("/home/agostif/Documents/GitHub/Lung_Cancer/extra/full_cohort_50kb.rds")
+CNA_FC = readRDS("/home/agostif/Documents/GitHub/Lung_Cancer/extra/full_cohort_50kb_CNAinformation.rds")
+# setkey(CNA_FC, sample)
+# CNA_FC[INFO_FC, `:=`(subtype=gsub("SQUAMOUS CELL CARCINOMA", "SQCC", gsub("ADENOCARCINOMA", "ADENO", subtype)), metastases=Type_of_metastases)]
+# CNA_FC = with(CNA_FC, GRanges(paste0("chr", chr), IRanges(start, end), type=CNA, sample=sample, subtype=subtype, metastases=metastases))
+CNA_FC[, type := ifelse(grepl("b$", sample), "Metastasis", "Primary")]
+CNA_FC[, sample := gsub("b$", "", sample)]
+CNA_FC = with(CNA_FC, GRanges(paste0("chr", chr), IRanges(start, end), sample=sample, CNA=CNA, type=type))
+CNA_FC = keepSeqlevels(CNA_FC, chromosomes, pruning.mode = "coarse")
+seqinfo(CNA_FC) = seqinfo(BSgenome.Hsapiens.UCSC.hg19::BSgenome.Hsapiens.UCSC.hg19)[chromosomes]
+CNA_FC = trim(CNA_FC)
+GENE_FC = readRDS("/home/agostif/Documents/GitHub/Lung_Cancer/extra/full-cohort-50kb_CNA-geneoverlaps-cosmicplus.rds")
+GENE_FC = with(GENE_FC, GRanges(paste0("chr", chr), IRanges(start, end), type=CNA, sample=sample, gene=gene))
+GENE_FC = keepSeqlevels(GENE_FC, chromosomes, pruning.mode = "coarse")
+
+# readRDS("/home/agostif/Documents/GitHub/Lung_Cancer/extra/BM_HQ_50kb.rds")
+CNA_BM = readRDS("/home/agostif/Documents/GitHub/Lung_Cancer/extra/BM_50kb_CNAinformation.rds")
+# setkey(CNA_BM, sample)
+# CNA_BM[INFO_BM, subtype := subtype]
+# CNA_BM = with(CNA_BM, GRanges(paste0("chr", chr), IRanges(start, end), type=CNA, sample=sample, subtype=gsub("Adeno", "ADENO", subtype), metastases=NA))
+CNA_BM[, type := "Metastasis"]
+CNA_BM = with(CNA_BM, GRanges(paste0("chr", chr), IRanges(start, end), sample=sample, CNA=CNA, type=type))
+CNA_BM = keepSeqlevels(CNA_BM, chromosomes, pruning.mode = "coarse")
+seqinfo(CNA_BM) = seqinfo(BSgenome.Hsapiens.UCSC.hg19::BSgenome.Hsapiens.UCSC.hg19)[chromosomes]
+CNA_BM = trim(CNA_BM)
+GENE_BM = readRDS("/home/agostif/Documents/GitHub/Lung_Cancer/extra/BM-50kb_CNA-geneoverlaps-cosmicplus.rds")
+GENE_BM = with(GENE_BM, GRanges(paste0("chr", chr), IRanges(start, end), type=CNA, sample=sample, gene=gene))
+GENE_BM = keepSeqlevels(GENE_BM, chromosomes, pruning.mode = "coarse")
+
+CNAs = list(FullCohort = CNA_FC, BM = CNA_BM)
+CNA_all = unlist(GRangesList(CNAs))
+```
+
+```{r segwaySegmentation, eval=FALSE}
+require("fishualize")
+
+segway = fread(cmd=paste("gunzip -c /home/agostif/Documents/GitHub/Lung_Cancer/extra/A549.bed.gz"))
+segway[grepl("Quiescent", V4), Label := "Quiescent"]
+segway[grepl("ConstitutiveHet", V4), Label := "ConstitutiveHet"]
+segway[grepl("FacultativeHet", V4), Label := "FacultativeHet"]
+segway[grepl("Transcribed", V4), Label := "Transcribed"]
+segway[grepl("Promoter", V4), Label := "Promoter"]
+segway[grepl("Enhancer", V4), Label := "Enhancer"]
+segway[grepl("RegPermissive", V4), Label := "RegPermissive"]
+segway[grepl("LowConfidence", V4), Label := "LowConfidence"]
+segway[, Label := factor(Label, c("Quiescent", "ConstitutiveHet", "FacultativeHet", "RegPermissive", "LowConfidence", "Enhancer", "Promoter", "Transcribed"))]
+segway = with(segway, GRanges(V1, IRanges(V2+1, V3), Label = Label))
+
+tab = as.data.table(segway)[, .(Width = sum(width)), by="Label"]
+tab[, Prop := Width/sum(Width)]
+setkey(tab, Label)
+
+pl = lapply(CNAs,
+       function(x){
+         overlaps = as.data.table(findOverlaps(c(resize(x, width = 1, fix = "start"), resize(x, width = 1, fix = "end")), segway))
+         overlaps = with(overlaps, data.table(as.data.frame(mcols(c(x, x)))[queryHits,], as.data.frame(mcols(segway))[subjectHits,]))
+         setnames(overlaps, c("Sample", "CNA", "Type", "Segway"))
+         return(overlaps)
+       })
+
+pl[[1]][, `:=`(Type = factor(Type, levels=c("Primary", "Metastasis")), Sample = factor(Sample, levels=paste0("MN", 1:57)))]
+pl = pl[[1]][, .N, by=c("Sample", "CNA", "Type", "Segway")]
+
+# gg = ggplot(pl, aes(x=paste(Sample, Type), y=N, fill=Segway)) + geom_bar(stat="identity", position="stack", col="grey75") + scale_x_discrete("Sample and CNA type") + scale_y_continuous("Occurrence") + scale_fill_manual(values = fishualize::fish(n = 8, option = "Hypsypops_rubicundus", end = 0.9)) + facet_wrap(~CNA, ncol=1) + theme(axis.text.x = element_text(angle=45, hjust = 1)) + theme_bw() + guides(fill=guide_legend(ncol=1))
+# ggsave(gg, filename = "A549_CNAs_Segway_Count.png", units = "in", width = 18, height = 8, dpi = 300)
+
+gg = ggplot(pl, aes(x=paste(CNA, Type), y=N, fill=Segway)) + geom_bar(stat="identity", position="fill", col="grey25", lwd=0.2) + scale_x_discrete("CNA and Sample type") + scale_y_continuous("Fraction of CNAs") + scale_fill_manual(values = fishualize::fish(n = 8, option = "Hypsypops_rubicundus", end = 0.9)) + facet_wrap(~Sample, ncol=9) + theme(axis.text.x = element_text(angle=45, hjust = 1)) + theme_bw() + guides(fill=guide_legend(ncol=1)) + coord_flip()
+ggsave(gg, filename = "A549_CNAs_Segway_Prop.png", units = "in", width = 18, height = 8, dpi = 300)
+
+pl = pl[, .(N = sum(N)), by=c("Type", "Sample", "Segway")]
+pl[, perSample := sum(N), by=c("Type", "Sample")]
+setkey(pl, Segway)
+pl[tab, Background := Prop]
+pl[, Ptest := prop.test(x=N, n=perSample, p=Background, alternative = "greater")$p.value, by=c("Sample", "Type", "Segway")]
+pl[, padj := p.adjust(Ptest, "BH")]
+
+
+sigSymbol <- function(pval){
+  stopifnot( is.vector(pval) )
+  
+  pval = as.list(pval)
+  
+  res = lapply(pval,
+               function(p){
+                 
+                 if( p<0.0001 ){
+                   return("****")
+                 }else if( p<0.001 ){
+                   return("***")
+                 }else if( p<0.01 ){
+                   return("**")
+                 }else if( p<0.05 ){
+                   return("*")
+                 }else{
+                   return("ns")
+                 }
+               })
+  return(unlist(res))
+}
+
+# pl[Type=="Metastasis", N := -N]
+setkey(pl, Sample)
+pl[, `:=`(x_index = .GRP, lab_x = ifelse(Type=="Primary", -0.2, 0.2)), by="Sample"]
+pl[, Type := factor(Type, levels=c("Primary", "Metastasis"))]
+
+# gg = ggplot(pl, aes(x=x_index, y=N, fill=Type)) + geom_bar(stat="identity", pos="dodge", col="grey25") + geom_hline(yintercept = 0, lwd=0.5, linetype="dashed") + scale_colour_lancet() + scale_fill_lancet() + geom_text(data=pl[padj<0.05], aes(x=x_index+lab_x, y=N, label=sigSymbol(padj))) + facet_wrap(~Segway, ncol=1, scales="free_y") + scale_x_continuous(breaks=1:51, labels=pl[order(x_index), unique(Sample)])
+
+tab = dcast.data.table(pl, Sample+Segway~Type, value.var = c("N", "perSample"))[!is.na(N_Primary+N_Metastasis), .(pval = prop.test(x=c(N_Primary, N_Metastasis), n=c(perSample_Primary, perSample_Metastasis), p=NULL, correct = TRUE)$p.value), by=c("Sample", "Segway")]
+
+gg = ggplot(pl, aes(x=Type, y=N/perSample, fill=Segway)) + geom_point(pch=21, col="grey25") + scale_x_discrete("", breaks=c("Primary", "Metastasis"), labels=c("P", "M")) + scale_y_continuous("Fraction of CNAs (per sample)") + scale_fill_npg() + facet_grid(Segway~Sample) + geom_text(data=tab[pval<0.05], aes(x=1.5, y=0.6, label=sigSymbol(pval)), col="black", size=6) + theme_bw() + theme(legend.position = "top")
+ggsave(gg, filename = "A549_CNAs_Segway_Compare.png", units = "in", width = 24, height = 10, dpi = 144)
+```
+
+```{r fishualize_test, eval=FALSE}
+tab = as.data.table(fishcolors)
+tab[, `:=`(index = seq_along(hex), col = paste(option, hex)), by="option"]
+ggplot(unique(tab), aes(x=option, col=col)) +
+  geom_segment(aes(xend=option, y=index-1, yend=index), lwd=2) +
+  scale_colour_manual(values=tab[, setNames(hex, paste(option, hex))]) + guides(col=FALSE, fill=FALSE) + coord_flip()
+```
+
+NOTE: the ENCBS902DWK has something weird on chromosome 15 (think about removing this sample)
+
+```{r readHiCcomp}
+comp_files = list.files(file.path(hic.folder, "juicer", "eigen"), pattern="1Mb.txt")
+eigen = rbindlist(lapply(setNames(comp_files, gsub("\\.1Mb\\.txt", "", comp_files)), function(x) fread(file.path(hic.folder, "juicer", "eigen", x))), idcol="name")
+eigen[, `:=`(start = (seq_len(nrow(.SD))-1)*1e6+1, end = seq_len(nrow(.SD))*1e6), by="name"]
+eigen[, c("Exp", "chrom") := tstrsplit(name, "_")[3:4]]
+setkeyv(eigen, c("chrom", "start", "end"))
+
+# Correct sign for replicates
+ref = eigen[Exp==eigen[1, Exp]]
+eigen = eigen[ref,]
+eigen[, toSwith := cor(V1, i.V1, use = "pairwise.complete.obs")<0, by=c("Exp", "chrom")]
+eigen[toSwith==TRUE, V1 := -V1]
+
+comp = keepSeqlevels(GRanges(eigen[, .(score=median(V1, na.rm = TRUE)), by=c("chrom", "start", "end")]), chromosomes, pruning.mode = "coarse")
+comp = split(comp, seqnames(comp))
+seqinfo(comp) <- seqinfo(genes)[seqlevels(comp)]
+comp = trim(comp)
+
+# marker = import.bw("/mnt/Storage2/ChIPseq/A549/results/bw/ChIPseq_A549_ENCFF648QLO_H3K27ac_2.dedup_mapq30_None.bw", as="RleList")
+marker = import.bw("/mnt/Storage2/ChIPseq/A549/results/bw/ChIPseq_A549_ENCFF552FLH_H3K4me3_1.dedup_mapq30_None.bw", as="RleList")
+names(marker) = paste0("chr", names(marker))
+marker = marker[names(marker)%in%chromosomes]
+
+comp = lapply(comp,
+              function(x){
+                pos = x[!is.na(x$score) & x$score>0.01,]
+                posL = sum(width(pos))
+                neg = x[!is.na(x$score) & x$score<(-0.01),]
+                negL = sum(width(neg))
+                pos = sum(sum(marker[pos]))
+                neg = sum(sum(marker[neg]))
+                print(paste(pos, posL, neg, negL, pos/posL, neg/negL))
+                pos = ifelse(length(pos)>0, pos/posL, 0)
+                neg = ifelse(length(neg)>0, neg/negL, 0)
+                tmp = data.table(as.data.frame(x))
+                tmp[score>0, compartment := ifelse(pos>neg, "A", "B")]
+                tmp[score<0, compartment := ifelse(pos>neg, "B", "A")]
+                return(tmp)
+              })
+
+CNAres = lapply(CNAs,
+       function(x){
+         overlaps = as.data.table(findOverlaps(c(resize(x, width = 1, fix = "start"), resize(x, width = 1, fix = "end")), GRanges(rbindlist(comp))))
+         x = c(x, x)
+         x$comp = as.character(NA)
+         x[overlaps[, queryHits],]$comp = GRanges(rbindlist(comp))[overlaps[, subjectHits],]$compartment
+         return(x)
+       })
+
+pl = rbindlist(lapply(CNAres, as.data.table), idcol="Dataset")
+pl = pl[, .N, by=c("Dataset", "sample", "CNA", "type", "comp")]
+# pl[CNA=="DEL", N := -N]
+pl[, `:=`(Dataset = factor(Dataset, levels=c("FullCohort", "BM")), CNA = factor(CNA, levels=c("AMP", "DEL")), type = factor(type, levels=c("Primary", "Metastasis")))]
+
+# gg = ggplot(pl[!is.na(comp)], aes(x=type, y=N, col=comp, fill=comp)) + geom_violin(col="black") + geom_boxplot(fill="white", width=0.2, position=position_dodge(width = 0.9), outlier.colour = NA) + facet_grid(Dataset~CNA) + scale_y_log10("Number of CNAs") + scale_colour_jco(name="Compartment") + scale_fill_jco(name="Compartment") + theme_bw()
+# ggsave(gg, filename = "A549_Compartment_CNAs_violin.png", units = "in", width = 12, height = 8, dpi = 300)
+
+gg = ggplot(pl[!is.na(comp)], aes(x=comp, y=N, fill=comp)) +
+  geom_violin() + geom_boxplot(fill="white", width=0.2, outlier.colour = NA) +
+  facet_grid(~Dataset+CNA+type) +
+  scale_y_log10("Number of CNAs") +
+  scale_colour_jco(name="Compartment") + scale_fill_jco(name="Compartment") +
+  theme_bw() +
+  stat_compare_means(comparisons = list(c("A", "B")))
+ggsave(gg, filename = "A549_Compartment_CNAs_violin.png", units = "in", width = 16, height = 6, dpi = 300)
+
+# gg = ggplot(pl[!is.na(comp), .(N = sum(N)), by=c("Dataset", "type", "comp", "sample")], aes(x=type, y=N, col=comp, fill=comp)) + geom_violin(col="black") + geom_boxplot(fill="white", width=0.2, position=position_dodge(width = 0.9), outlier.colour = NA) + facet_grid(~Dataset) + scale_y_log10("Number of CNAs") + scale_colour_jco(name="Compartment") + scale_fill_jco(name="Compartment") + theme_bw()
+# ggsave(gg, filename = "A549_Compartment_CNAs_violin2.png", units = "in", width = 12, height = 6, dpi = 300)
+
+gg = ggplot(pl[!is.na(comp), .(N = sum(N)), by=c("Dataset", "type", "comp", "sample")], aes(x=comp, y=N, fill=comp)) +
+  geom_violin() + geom_boxplot(fill="white", width=0.2, outlier.colour = NA) +
+  facet_grid(~Dataset+type) +
+  scale_y_log10("Number of CNAs") +
+  scale_colour_jco(name="Compartment") + scale_fill_jco(name="Compartment") +
+  theme_bw() +
+  stat_compare_means(comparisons = list(c("A", "B")))
+ggsave(gg, filename = "A549_Compartment_CNAs_violin_stats.png", units = "in", width = 12, height = 6, dpi = 300)
+
+# gg = ggplot(pl[!is.na(comp)], aes(x=paste(type, sample), y=N, fill=comp)) +
+#   geom_bar(stat="identity", position="dodge", width = 0.7) +
+#   geom_hline(yintercept = 0) +
+#   facet_wrap(~Dataset, nrow=2, scales="free_x") +
+#   scale_fill_jco(name="Compartment") +
+#   scale_y_continuous("Number of CNAs") +
+#   theme_bw()
+# ggsave(gg, filename = "A549_Compartment_CNAs.png", units = "in", width = 18, height = 8, dpi = 300)
+# 
+# pl[, `:=`(type = factor(type, levels=c("Primary", "Metastasis")), sample = factor(sample, levels=paste0("MN", 1:51)))]
+# gg = ggplot(pl[!is.na(comp) & Dataset=="FullCohort" & !is.na(sample)], aes(x=sample, y=N, fill=comp)) +
+#   ggtitle("Full cohort dataset") +
+#   geom_bar(stat="identity", position="dodge", width = 0.7) +
+#   geom_hline(yintercept = 0) +
+#   facet_wrap(~type, nrow=2) +
+#   scale_fill_jco(name="Compartment") +
+#   scale_x_discrete("") +
+#   scale_y_continuous("Number of CNAs") +
+#   theme_bw() + theme(legend.position = "bottom")
+# ggsave(gg, filename = "A549_Compartment_CNAs_FC.png", units = "in", width = 18, height = 8, dpi = 300)
+
+tab  = as.data.table(CNAs[[1]])[, .(N = .N*2), by=c("sample", "type")]
+setkeyv(tab, c("sample", "type"))
+
+pl = rbindlist(lapply(CNAres, as.data.table), idcol="Dataset")
+pl = pl[Dataset=="FullCohort" & !is.na(comp), .N, by=c("sample", "type", "comp")]
+setkeyv(pl, c("sample", "type"))
+
+pl[tab, Frac := N/i.N]
+pl = melt.data.table(dcast.data.table(pl, sample+type~comp, value.var = "Frac", fill = 0),
+                     id.vars = c("sample", "type"), measure.vars = c("A", "B"), variable.name = "comp", value.name = "Frac")
+pl[, `:=`(type = factor(type, levels=c("Primary", "Metastasis")), sample = factor(sample, levels=paste0("MN", 1:60)))]
+gg = ggplot(pl, aes(x=type, y=Frac, fill=comp)) +
+  geom_bar(stat="identity", position="dodge", col="grey25", alpha=0.75) +
+  scale_fill_brewer(palette="Set1") +
+  facet_wrap(~sample, ncol=13) +
+  geom_text(data=tab, aes(x=type, label=N), y=-0.075, inherit.aes = FALSE) +
+  coord_cartesian(ylim = c(-0.1, 1)) +
+  theme_bw() + theme(legend.position = c(0.965, 0.1)) +
+  guides(fill=guide_legend(title="")) + labs(x="Sample type", y="Fraction of CNAs")
+ggsave(gg, filename = "A549_Compartment_FC_perSample.png", units = "in", width = 18, height = 8, dpi = 300)
+```
+
+```{r readHiCsubcomp}
+subcomp = fread("/home/agostif/Documents/GitHub/Lung_Cancer/subcompartments/A549_hg19_LiftOver.bed", col.names = c("seqnames", "start", "end", "name"))
+subcomp = subcomp[seqnames%in%chromosomes & !is.na(name),]
+
+tab = as.data.table(table(subcomp$name))
+setnames(tab, c("SC", "Count"))
+tab[, Frac := Count/sum(Count) ]
+tab[, pos := cumsum(Frac)-Frac/2]
+setkey(tab, SC)
+
+gg = ggplot(tab, aes(x=as.factor(1), y=Frac, fill=SC)) +
+  ggtitle("NDB MEGABASE subcompartments", subtitle = "Bins of 50kb") + 
+  geom_bar(stat="identity", position="stack", col="grey75") +
+  coord_polar(theta = "y") +
+  theme_void() +
+  geom_text(aes(y=1-pos, label=Count), x=1.3, size=5) +
+  scale_fill_tableau(palette="Tableau 10") +
+  guides(fill=guide_legend(title = element_blank()))
+ggsave(gg, filename = "A549_subcompartments.png", units = "in", width = 8, height = 6, dpi = 300)
+
+# subcomp = import.bed(file.path(hic.folder, "sniper/A549_ENCSR662QKG_ENCBS631PPT.noChr.bed"))
+
+# hap1 = as.data.table(table(fread("/home/agostif/Downloads/HAP1_track_hg19.bed", skip=1)[, V4]))
+# hap1[, Frac := N/sum(N) ]
+# hap1[, pos := cumsum(Frac)-Frac/2]
+# gg = ggplot(hap1, aes(x=as.factor(1), y=Frac, fill=V1)) +
+#   ggtitle("SNIPER subcompartments in HAP1") + 
+#   geom_bar(stat="identity", position="stack", col="grey75") +
+#   coord_polar(theta = "y") +
+#   theme_void() +
+#   geom_text(aes(y=1-pos, label=N), x=1.3, size=5) +
+#   scale_fill_tableau(palette="Tableau 10") +
+#   guides(fill=guide_legend(title = element_blank()))
+# ggsave(gg, filename = "HAP1_subcompartments.png", units = "in", width = 8, height = 6, dpi = 300)
+
+CNAres = lapply(CNAs,
+       function(x){
+         overlaps = as.data.table(findOverlaps(c(resize(x, width = 1, fix = "start"), resize(x, width = 1, fix = "end")), GRanges(subcomp)))
+         x = c(x, x)
+         x$subcomp = as.character(NA)
+         x[overlaps[, queryHits],]$subcomp = subcomp[overlaps[, subjectHits],]$name
+         return(as.data.table(x))
+       })
+CNAres = rbindlist(CNAres, idcol="Dataset")
+
+pl = CNAres[, .N, by=c("Dataset", "sample", "type", "CNA", "subcomp")]
+pl[, P := N/sum(N), by=c("Dataset", "sample", "type", "CNA")]
+pl[Dataset=="BM", type := "Metastasis_BM"][, type := factor(type, levels=c("Primary", "Metastasis", "Metastasis_BM"))]
+
+gg1 = ggplot(pl[!is.na(subcomp)], aes(x=type, y=P, fill=CNA, col=CNA)) +
+  geom_violin(col="black", alpha=0.75) + geom_boxplot(fill="white", width=0.2, outlier.shape = NA, position = position_dodge(0.9)) +
+  scale_x_discrete("Dataset") + scale_y_continuous("Fraction of CNAs (per sample)") +
+  scale_colour_brewer(palette="Set1") + scale_fill_brewer(palette="Set1") +
+  facet_wrap(~subcomp, ncol=5) + theme_few() + theme(axis.text = element_text(family="Helvetica", colour="black"),
+                                                     axis.title = element_text(family="Helvetica", colour="black"),
+                                                     strip.text = element_text(family="Helvetica", colour="black"),
+                                                     legend.text = element_text(family="Helvetica", colour="black"),
+                                                     legend.title = element_text(family="Helvetica", colour="black"),
+                                                     panel.border = element_rect(colour="black"))
+ggsave(gg1, filename = "A549_subcompartments_type_CNA.png", units = "in", width = 16, height = 4, dpi = 300)
+
+for(sc in c("A1", "A2", "B1", "B2", "B3")){
+  gg = ggplot(pl[!grepl("BM", type) & subcomp==sc,], aes(x=type, y=P, fill=CNA, col=CNA)) +
+    geom_violin(col="black", alpha=0.75) + geom_boxplot(fill="white", width=0.1, outlier.shape = NA, position = position_dodge(0.9)) +
+    scale_x_discrete("Dataset") + scale_y_continuous("Fraction of CNAs (per sample)", limits=c(0, 1)) +
+    scale_colour_brewer(palette="Set1") + scale_fill_brewer(palette="Set1") +
+    facet_wrap(~subcomp) + theme_few() + theme(axis.text = element_text(family="Helvetica", colour="black"),
+                                               axis.title = element_text(family="Helvetica", colour="black"),
+                                               strip.text = element_text(family="Helvetica", colour="black"),
+                                               legend.text = element_text(family="Helvetica", colour="black"),
+                                               legend.title = element_text(family="Helvetica", colour="black"),
+                                               panel.border = element_rect(colour="black"))
+  ggsave(gg, filename = paste0("A549_subcompartments_type_CNA_", sc, ".pdf"), width = 5, height = 6, device = cairo_pdf)
+}
+
+
+pl = CNAres[, .N, by=c("Dataset", "sample", "type", "subcomp")]
+pl[, P := N/sum(N), by=c("Dataset", "sample", "type")]
+pl[Dataset=="BM", type := "Metastasis_BM"][, type := factor(type, levels=c("Primary", "Metastasis", "Metastasis_BM"))]
+pl = pl[!is.na(subcomp)]
+gg2 = ggplot(pl, aes(x=type, y=P, fill=subcomp, col=subcomp)) +
+  geom_violin(col="black", alpha=0.75) + geom_boxplot(fill="white", width=0.2, outlier.shape = NA, position = position_dodge(0.9)) +
+  scale_x_discrete("Dataset") + scale_y_continuous("Fraction of CNAs (per sample)") +
+  scale_colour_tableau(palette="Tableau 10") + scale_fill_tableau(palette="Tableau 10") +
+  facet_wrap(~subcomp, ncol=5) + theme_few() + theme(axis.text = element_text(family="Helvetica", colour="black"),
+                                                     axis.title = element_text(family="Helvetica", colour="black"),
+                                                     strip.text = element_text(family="Helvetica", colour="black"),
+                                                     legend.text = element_text(family="Helvetica", colour="black"),
+                                                     legend.title = element_text(family="Helvetica", colour="black"),
+                                                     panel.border = element_rect(colour="black"))
+ggsave(gg2, filename = "A549_subcompartments_type.png", units = "in", width = 16, height = 4, dpi = 300)
+
+gg = ggarrange(gg2, gg1, nrow=2)
+ggsave(gg, filename = "A549_subcompartments_panel2.pdf", width = 16, height = 8, device = cairo_pdf)
+
+pl = CNAres[, .N, by=c("Dataset", "sample", "type", "subcomp")]
+pl = melt.data.table(dcast.data.table(pl, Dataset+sample+type~subcomp, value.var = "N", fill=0),
+                id.vars = c("Dataset", "sample", "type"), measure.vars = c("A1", "A2", "B1", "B2", "B3", "NA"), variable.name = "subcomp", value.name = "N")
+
+pl[, Tot := sum(N), by=c("Dataset", "sample", "type")]
+setkey(pl, subcomp)
+pl[tab, `:=`(Frac = Frac, enrichment = log2( (N/Tot)/Frac ))]
+
+# ggplot(pl, aes(x=sample, y=N, fill=subcomp)) + geom_bar(stat="identity", position="dodge") + facet_wrap(~Dataset+type, nrow=4, scales="free_x")
+pl[!is.finite(enrichment), enrichment := NA]
+pl[, `:=`(type = factor(type, levels=c("Primary", "Metastasis")), sample = factor(sample, levels=paste0("MN", 1:60)))]
+gg = ggplot(pl[!is.na(Frac),], aes(x=sample, y=enrichment, fill=type)) +
+  geom_hline(yintercept = c(-1, 1), linetype="dotted") + geom_hline(yintercept = c(-2, 2), linetype="dashed") +
+  geom_bar(stat="identity", position="dodge", colour="grey25") +
+  scale_fill_lancet(alpha=0.75) +
+  facet_wrap(~subcomp, nrow=5, scales="free_x", strip.position = "right") +
+  ylim(-2.5, 2.5) + theme_bw() + theme(legend.position="top") +
+  guides(fill=guide_legend(title="")) + labs(x="Sample", y="log2(Observed/Expected)")
+ggsave(gg, filename = "A549_subcompartments_enrichment.png", units = "in", width = 20, height = 10, dpi = 300)
+
+CNA_split = split(CNAs[[1]], CNAs[[1]]$type)
+CNA_split = c(CNA_split, CNAs[2])
+CNA_split = lapply(CNA_split, function(x) c(resize(x, 1, fix="start"), resize(x, 1, fix="end")))
+CNA_split = lapply(CNA_split, function(x) split(x, x$CNA))
+
+pl = rbindlist(lapply(CNA_split, function(x){
+  rbindlist(lapply(x, function(y){
+    tmp = data.table(subcomp, count = countOverlaps(GRanges(subcomp), y))
+    return(tmp)
+    }), idcol="CNA")
+  }), idcol="Type")
+pl = pl[order(name), .(count = sum(count)), by=c("Type", "CNA", "name")]
+pl[, perc := count/sum(count), by=c("Type", "CNA")]
+pl[, pos := cumsum(perc)-perc/2, by=c("Type", "CNA")]
+pl[, label := paste(CNA, Type)]
+pl = pl[order(label),]
+gg = ggplot(pl, aes(x=as.factor(1), y=perc, fill=name)) +
+  geom_bar(position="stack", stat="identity", col="black") +
+  geom_text(aes(y=1-pos, label=count), x=1.3, size=3, family="Helvetica", colour="black") +
+  scale_fill_tableau(palette="Tableau 10") +
+  facet_wrap(~label) +
+  coord_polar(theta = "y") +
+  theme_void() + theme(strip.text = element_text(family="Helvetica", colour="black"),
+                       legend.text = element_text(family="Helvetica", colour="black")) +
+  guides(fill=guide_legend(title = element_blank()))
+ggsave(gg, filename = "A549_subcompartments_CNAs.png", units = "in", width = 12, height = 6, dpi = 300)
+ggsave(gg, filename = "A549_subcompartments_panel1.pdf", width = 12, height = 6, device = cairo_pdf)
+```
+
+```{r readHiCtads}
+# tads = list.files(file.path(hic.folder, "juicer/arrowhead/"), pattern="_5000_blocks.bedpe$")
+# tads = setNames(tads, gsub("_5000_blocks.bedpe", "", tads))
+# tads = rbindlist(lapply(tads, function(x) fread(file.path(hic.folder, "juicer", "arrowhead", x), skip=2)), idcol="name")
+#
+# # Check visually
+# tads[, GRP := .GRP, by="name"]
+# ggplot(tads, aes(x=V2, xend=V3, y=GRP, yend=GRP)) + geom_segment() + facet_wrap(~V1, scales="free_x", ncol=2)
+#
+# tads = unique(with(tads, GRanges(V1, IRanges(V2, V3), res=name)))
+
+tads = fread(file.path(hic.folder, "juicer/arrowhead/", "A549_ENCSR662QKG_pooled_5000_blocks.bedpe"), skip=2)
+tads = with(tads, GRanges(V1, IRanges(V2, V3)))
+
+tads = keepSeqlevels(tads, chromosomes, pruning.mode = "coarse")
+pl_tads = data.table(as.data.frame(tads))
+
+FC_set = split(CNA_FC, CNA_FC$type)
+names(FC_set) = paste("FC", names(FC_set), sep="_")
+BM_set = split(CNA_BM, CNA_BM$type)
+names(BM_set) = paste("BM", names(BM_set), sep="_")
+
+tab = rbindlist(lapply(c(FC_set, BM_set),
+                       function(x)
+                         data.table(n=length(x)*2,
+                                    p=sum(width(reduce(tads)))/2864785220, # Effective size taken from DeepTools
+                                    inTAD=sum(countOverlaps(reduce(tads), c(resize(x, 1, fix="start"), resize(x, 1, fix="end")))))), idcol="Set")
+
+tab[, pval := prop.test(x=inTAD, n=n, p=p, alternative = "greater")$p.value, by="Set"]
+tab[, label := symnum(pval, cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), symbols = c("****", "***", "**", "*", "ns"))]
+tab[, Set := factor(Set, levels=paste(rep(c("FC", "BM"), each=2), c("Primary", "Metastasis"), sep="_"))]
+gg = ggplot(tab, aes(x=Set, y=inTAD/n)) +
+  geom_hline(yintercept = unique(tab[,p]), lty=2, col="grey25") +
+  geom_bar(stat="identity", position="identity", col="grey25", fill="grey75")  +
+  geom_text(aes(label=label), vjust=-1) +
+  labs(x="", y="Fraction of CNAs in TADs") + theme_bw()
+ggsave(gg, filename = "A549_CNAs_in_TADs.png", units = "in", width = 8, height = 6, dpi = 300)
+
+FC_set = split(CNA_FC, paste(CNA_FC$type, CNA_FC$CNA, sep="_"))
+names(FC_set) = paste("FC", names(FC_set), sep="_")
+BM_set = split(CNA_BM, paste(CNA_BM$type, CNA_BM$CNA, sep="_"))
+names(BM_set) = paste("BM", names(BM_set), sep="_")
+
+tab = rbindlist(lapply(c(FC_set, BM_set),
+                       function(x)
+                         data.table(n=length(x)*2,
+                                    p=sum(width(reduce(tads)))/2864785220, # Effective size taken from DeepTools
+                                    inTAD=sum(countOverlaps(reduce(tads), c(resize(x, 1, fix="start"), resize(x, 1, fix="end")))))), idcol="Set")
+
+tab[, pval := prop.test(x=inTAD, n=n, p=p, alternative = "greater")$p.value, by="Set"]
+tab[, label := symnum(pval, cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), symbols = c("****", "***", "**", "*", "ns"))]
+tab[, Set := factor(Set, levels=paste(rep(c("FC", "BM"), each=4), rep(c("Primary", "Metastasis"), each=2), c("AMP", "DEL"), sep="_"))]
+
+gg = ggplot(tab, aes(x=Set, y=inTAD/n)) +
+  geom_hline(yintercept = unique(tab[,p]), lty=2, col="grey25") +
+  geom_bar(stat="identity", position="identity", col="grey25", fill="grey75")  +
+  geom_text(aes(label=label), vjust=-1) +
+  labs(x="", y="Fraction of CNAs in TADs") + theme_bw()
+ggsave(gg, filename = "A549_CNAs_in_TADs_CNAs.png", units = "in", width = 12, height = 6, dpi = 300)
+
+# 
+pl = lapply(CNAs,
+            function(x)
+              data.table(as.data.frame(mcols(c(x, x))),
+                         distance = as.data.table(distanceToNearest(c(resize(x, 1, fix="start"), resize(x, 1, fix="end")),
+                                                                    c(resize(tads, 1, fix="start"), resize(tads, 1, fix="end"))))[, distance+1]))
+
+pl[[1]][, `:=`(type = factor(type, levels=c("Primary", "Metastasis")), sample = factor(sample, levels=paste0("MN", 1:60)))]
+pl = rbindlist(pl, idcol="Set")
+pl[, Set := factor(Set, levels=c("FullCohort", "BM"))]
+
+gg = ggplot(pl, aes(x=distance, fill=CNA)) +
+  geom_histogram(bins = 50, alpha=0.75) +
+  scale_x_log10() +
+  scale_fill_brewer(palette="Set1") +
+  facet_grid(Set~type+CNA) + theme_bw() +
+  labs(x = "Distance to neatest TAD boundary (kb)", y = "Count") + guides(fill=guide_legend(title = ""))
+ggsave(gg, filename = "A549_CNAs_TADs_FC_histogram.png", units = "in", width = 12, height = 6, dpi = 300)
+
+gg = ggplot(pl, aes(x=type, y=distance/1e3, fill=CNA)) +
+  geom_boxplot(alpha=0.75, notch=TRUE) +
+  scale_y_log10() +
+  facet_grid(~Set, scales = "free_x") +
+  scale_fill_brewer(palette="Set1") +
+  theme_bw() + labs(x="", y="Distance to neatest TAD boundary (kb)") + guides(fill=guide_legend(title = "CNA Type"))
+ggsave(gg, filename = "A549_CNAs_TADs_allSets.png", units = "in", width = 10, height = 6, dpi = 300)
+
+gg = ggplot(pl[Set=="FullCohort",], aes(x=type, y=distance/1e3)) +
+  geom_boxplot(alpha=0.75, notch=TRUE, aes(fill=CNA)) +
+  scale_y_log10() +
+  facet_wrap(~CNA) +
+  scale_fill_brewer(palette="Set1") +
+  theme_bw() + labs(x = "", y="Distance to neatest TAD boundary (kb)") +
+  guides(fill=guide_legend(title = "")) +
+  stat_compare_means(comparisons = list(c("Primary", "Metastasis")))
+ggsave(gg, filename = "A549_CNAs_TADs_FC_Type.png", units = "in", width = 10, height = 8, dpi = 300)
+
+gg = ggplot(pl[Set=="FullCohort",], aes(x=CNA, y=distance/1e3, fill=CNA)) +
+  geom_boxplot(alpha=0.75, notch=TRUE) +
+  scale_y_log10() +
+  scale_fill_brewer(palette="Set1") +
+  theme_bw() + labs(x = "", y="Distance to neatest TAD boundary (kb)") +
+  guides(fill=guide_legend(title = "")) +
+  stat_compare_means(comparisons = list(c("AMP", "DEL")), inherit.aes = FALSE)
+ggsave(gg, filename = "A549_CNAs_TADs_BM_Type.png", units = "in", width = 8, height = 8, dpi = 300)
+
+# By Set
+CNA_FC_AMP = coverage(CNA_FC[CNA_FC$CNA=="AMP",])/length(unique(paste(CNA_FC$type, CNA_FC$sample)))
+CNA_FC_DEL = coverage(CNA_FC[CNA_FC$CNA=="DEL",])/length(unique(paste(CNA_FC$type, CNA_FC$sample)))
+CNA_BM_AMP = coverage(CNA_BM[CNA_BM$CNA=="AMP",])/length(unique(paste(CNA_BM$type, CNA_BM$sample)))
+CNA_BM_DEL = coverage(CNA_BM[CNA_BM$CNA=="DEL",])/length(unique(paste(CNA_BM$type, CNA_BM$sample)))
+
+pl_cnas = rbindlist(lapply(list(CNA_FC_AMP=CNA_FC_AMP, CNA_FC_DEL=CNA_FC_DEL, CNA_BM_AMP=CNA_BM_AMP, CNA_BM_DEL=CNA_BM_DEL),
+                           function(x)
+                             data.table(as.data.frame(GRanges(x)))[score>0, .(N=sum(score)), by=c("seqnames", "start", "end")]), idcol = "Dataset")
+pl_cnas[, c("Dataset", "Type") := tstrsplit(Dataset, "_")[2:3]]
+
+pl_cnas[Type=="DEL", N := -N][, Type := factor(Type, levels=c("DEL", "AMP"))]
+
+gg = ggplot() +
+  ggtitle("Chromosome 10") +
+  geom_rect(data=pl_cnas[seqnames=="chr10",], aes(xmin=start, xmax=end, ymin=0, ymax=N, fill=Type)) +
+  # geom_segment(data=pl_cnas[seqnames=="chr10",], aes(x=start, xend=end, y=N, yend=N, col=paste(Type, Dataset))) +
+  geom_segment(data=pl_tads[seqnames=="chr10",], aes(x = start, xend = end, y = 0, yend = 0), col="black", lwd=2) +
+  scale_x_continuous("Genomic positon (bp)") + scale_y_continuous("CNA occurence (Fraction of datasets)") +
+  scale_fill_tableau(palette="Classic Blue-Red 6") +
+  facet_wrap(~Dataset, ncol=1) +
+  theme_bw() + theme(legend.position = "bottom") + guides(fill=guide_legend(title="CNA type"))
+ggsave(gg, filename = "A549_TADs_CNAs_chr10.png", units = "in", width = 12, height = 6, dpi = 300)
+
+gg = ggplot() +
+  geom_segment(data=pl_cnas, aes(x=start, xend=end, y=N, yend=N, col=paste(Type, Dataset))) +
+  geom_segment(data=pl_tads, aes(x = start, xend = end, y = 0, yend = 0), col="firebrick3", lwd=2) +
+  scale_x_continuous("Genomic positon (bp)") + scale_y_continuous("CNA occurence (Fraction of datasets)") +
+  scale_colour_tableau(palette="Classic Blue-Red 12") +
+  facet_wrap(~seqnames, ncol=4, scales="free_x") +
+  theme_bw() + theme(legend.position = "bottom") + guides(colour=guide_legend(title="Dataset and CNA type"))
+ggsave(gg, filename = "A549_TADs_CNAs.png", units = "in", width = 20, height = 10, dpi = 144)
+
+# By Type
+CNA_Primary_AMP = coverage(CNA_FC[CNA_FC$type=="Primary" & CNA_FC$CNA=="AMP",])/length(unique(CNA_FC$sample))
+CNA_Primary_DEL = coverage(CNA_FC[CNA_FC$type=="Primary" & CNA_FC$CNA=="DEL",])/length(unique(CNA_FC$sample))
+CNA_Metastasis_AMP = coverage(CNA_FC[CNA_FC$type=="Metastasis" & CNA_FC$CNA=="AMP",])/length(unique(CNA_FC$sample))
+CNA_Metastasis_DEL = coverage(CNA_FC[CNA_FC$type=="Metastasis" & CNA_FC$CNA=="DEL",])/length(unique(CNA_FC$sample))
+
+pl_cnas = rbindlist(lapply(list(CNA_Primary_AMP=CNA_Primary_AMP, CNA_Primary_DEL=CNA_Primary_DEL,
+                                CNA_Metastasis_AMP=CNA_Metastasis_AMP, CNA_Metastasis_DEL=CNA_Metastasis_DEL),
+                           function(x)
+                             data.table(as.data.frame(GRanges(x)))[score>0, .(N=sum(score)), by=c("seqnames", "start", "end")]), idcol = "Dataset")
+pl_cnas[, c("Dataset", "Type") := tstrsplit(Dataset, "_")[2:3]]
+
+pl_cnas[Type=="DEL", N := -N][, `:=`(Dataset = factor(Dataset, levels=c("Primary", "Metastasis")), Type = factor(Type, levels=c("DEL", "AMP")))]
+
+gg = ggplot() +
+  ggtitle("Chromosome 10") +
+  geom_rect(data=pl_cnas[seqnames=="chr10",], aes(xmin=start, xmax=end, ymin=0, ymax=N, fill=Type)) +
+  # geom_segment(data=pl_cnas[seqnames=="chr10",], aes(x=start, xend=end, y=N, yend=N, col=paste(Type, Dataset))) +
+  geom_segment(data=pl_tads[seqnames=="chr10",], aes(x = start, xend = end, y = 0, yend = 0), col="black", lwd=2) +
+  scale_x_continuous("Genomic positon (bp)") + scale_y_continuous("CNA occurence (Fraction of datasets)") +
+  scale_fill_tableau(palette="Classic Blue-Red 6") +
+  facet_wrap(~Dataset, ncol=1) +
+  theme_bw() + theme(legend.position = "bottom") + guides(fill=guide_legend(title="CNA type"))
+ggsave(gg, filename = "A549_TADs_CNAs_Type_chr10.png", units = "in", width = 12, height = 6, dpi = 300)
+
+gg = ggplot() +
+  geom_segment(data=pl_cnas, aes(x=start, xend=end, y=N, yend=N, col=paste(Type, Dataset))) +
+  geom_segment(data=pl_tads, aes(x = start, xend = end, y = 0, yend = 0), col="firebrick3", lwd=2) +
+  scale_x_continuous("Genomic positon (bp)") + scale_y_continuous("CNA occurence (Fraction of datasets)") +
+  scale_colour_tableau(palette="Classic Blue-Red 12") +
+  facet_wrap(~seqnames, ncol=4, scales="free_x") +
+  theme_bw() + theme(legend.position = "bottom") + guides(colour=guide_legend(title="Dataset and CNA type"))
+ggsave(gg, filename = "A549_TADs_CNAs_Type.png", units = "in", width = 20, height = 10, dpi = 144)
+
+
+pl_cnas = rbindlist(lapply(list(CNA_AMP=CNA_Primary_AMP-CNA_Metastasis_AMP, CNA_DEL=CNA_Primary_DEL-CNA_Metastasis_DEL),
+                           function(x)
+                             data.table(as.data.frame(GRanges(x)))[, .(N=sum(score)), by=c("seqnames", "start", "end")]), idcol = "Dataset")
+pl_cnas[, c("Type") := tstrsplit(Dataset, "_")[2]]
+
+pl_cnas[, Type := factor(Type, levels=c("DEL", "AMP"))]
+
+gg = ggplot() +
+  geom_segment(data=pl_cnas, aes(x=start, xend=end, y=N, yend=N, col=Type)) +
+  geom_segment(data=pl_tads, aes(x = start, xend = end, y = 0, yend = 0), col="firebrick3", lwd=2) +
+  scale_x_continuous("Genomic positon (bp)") + scale_y_continuous("Delta occurrence (Primary - Metastasis)") +
+  scale_colour_tableau(palette="Classic Blue-Red 6") +
+  facet_wrap(~seqnames, ncol=4, scales="free_x") +
+  theme_bw() + theme(legend.position = "bottom") + guides(colour=guide_legend(title="CNA type"))
+ggsave(gg, filename = "A549_TADs_CNAs_Type_Delta.png", units = "in", width = 20, height = 10, dpi = 144)
+
+
+# tads_sets = list(Upstream = flank(tads, 25e3, start = TRUE, both=FALSE),
+#                  inStart = resize(tads, 25e3, fix = "start"),
+#                  inEnd = resize(tads, 25e3, fix = "end"),
+#                  Downstream = flank(tads, 25e3, start = FALSE, both=FALSE))
+# 
+# lapply(CNA_split, function(y) colSums(as.data.table(sapply(tads_sets, function(x) countOverlaps(x, y)))))
+# 
+# loops_sets = list(Upstream = flank(loops, 1e4, start = TRUE, both=FALSE),
+#                  inStart = resize(loops, 1e4, fix = "start"),
+#                  inEnd = resize(loops, 1e4, fix = "end"),
+#                  Downstream = flank(loops, 1e4, start = FALSE, both=FALSE))
+# 
+# lapply(CNA_split, function(y) colSums(as.data.table(sapply(loops_sets, function(x) countOverlaps(x, y)))))
+
+CNA_split = split(CNAs[[1]], CNAs[[1]]$type)
+CNA_split = c(CNA_split, CNAs[2])
+
+x = CNA_split[[1]]
+tmp = data.table(as.data.frame(x))
+tmp[, overlapTAD := overlapsAny(x, tads)]
+tmp[overlapTAD==TRUE, withinTAD := overlapsAny(GRanges(.SD), tads[order(-width(tads))], type="within")]
+
+```
+
+```{r NatGenFig1}
+# tads = list.files(file.path(hic.folder, "juicer/arrowhead/"), pattern="_25000_blocks.bedpe$")
+# tads = setNames(tads, gsub("_25000_blocks.bedpe", "", tads))
+# tads = rbindlist(lapply(tads, function(x) fread(file.path(hic.folder, "juicer", "arrowhead", x), skip=2)), idcol="name")
+# tads[, as.list(summary(V3-V2)), by="name"]
+# tads = unique(with(tads, GRanges(V1, IRanges(V2, V3), res=name)))
+# tads = keepSeqlevels(tads, chromosomes, pruning.mode = "coarse")
+
+tads = fread(file.path(hic.folder, "juicer/arrowhead/", "A549_ENCSR662QKG_pooled_25000_blocks.bedpe"), skip=2)
+tads = with(tads, GRanges(V1, IRanges(V2, V3)))
+tads = keepSeqlevels(tads, chromosomes, pruning.mode = "coarse")
+
+CNA_dt = rbindlist(lapply(CNAs, as.data.frame))
+CNA_dt[, `:=`(label = ifelse(grepl("BM", sample), paste("BM", type, sep="_"), paste("FC", type, sep="_")),
+              group = cut(width-1, breaks = c(-Inf, 2e6, 4e6, 8e6, 2e7, 5e7, 1e8, 2.5e8, Inf), labels = c("2", "4", "8", "20", "50", "100", "250", "250+")))]
+
+CNA_sel = CNA_dt[group=="2"]
+CNA_sel = CNA_sel[overlapsAny(GRanges(CNA_sel), tads)]
+CNA_sel[, inTAD := overlapsAny(GRanges(CNA_sel), tads, type="within")]
+
+pl = melt.data.table(CNA_sel[, .(inTAD=sum(inTAD)/.N, outTAD=1-sum(inTAD)/.N, N=nrow(.SD)-sum(inTAD)), by=c("label", "CNA")], id.vars = c("label", "CNA", "N"))
+pl[, pos := 1-(cumsum(value)-value/2), by=c("label", "CNA")]
+pl[, `:=`(label = factor(label, levels=paste(rep(c("FC", "BM"), each=2), c("Primary", "Metastasis"), sep="_")))]
+gg = ggplot(pl, aes(x=as.factor(1), y=value, fill=variable)) +
+  ggtitle("Analysis as in Nature Genetics Figure 1B",
+          subtitle="The percentage of short-range CNAs (length ≤ 2 Mb) across TADs (orange) and within TADs (blue) for different CNA types.") +
+  geom_bar(stat="identity", position="stack", colour="black") +
+  facet_grid(CNA~label, switch = "both") +
+  scale_fill_d3(alpha = 0.75, labels=c("Within TAD", "Across TADs")) +
+  geom_text(aes(y=pos, label=percent(value)), x=1.2, size=3, family="Helvetica", colour="black") +
+  coord_polar(theta = "y") + theme_void() + theme(title = element_text(family="Helvetica", colour="black"),
+                                                  strip.text = element_text(family="Helvetica", colour="black"),
+                                                  legend.text = element_text(family="Helvetica", colour="black")) +
+  guides(fill=guide_legend(title = element_blank()))
+ggsave(gg, filename = "A549_CNAs_TADs_NatGenFig1B.png", units = "in", width = 10, height = 6, dpi = 300)
+# ggsave(gg, filename = "A549_CNAs_TADs_panel1.pdf", width = 10, height = 6, device = cairo_pdf)
+
+for(cn in c("AMP", "DEL")){
+  for(lb in c("FC_Primary", "FC_Metastasis")){
+    gg = ggplot(pl[label==lb & CNA==cn], aes(x=as.factor(1), y=value, fill=variable)) +
+      geom_bar(stat="identity", position="stack", colour="black") +
+      facet_wrap(~label+CNA) +
+      scale_fill_d3(alpha = 0.75, labels=c("Within TAD", "Across TADs")) +
+      geom_text(aes(y=pos, label=percent(value)), x=1.2, size=3, family="Helvetica", colour="black") +
+      coord_polar(theta = "y") + theme_void() + theme(title = element_text(family="Helvetica", colour="black"),
+                                                      strip.text = element_text(family="Helvetica", colour="black"),
+                                                      legend.text = element_text(family="Helvetica", colour="black")) +
+      guides(fill=guide_legend(title = element_blank()))
+    
+    ggsave(gg, filename = paste0("A549_CNAs_TADs_", lb, "_", cn, ".pdf"), width = 6, height = 5, device = cairo_pdf)
+    }
+  }
+
+tab_ref = pl[variable=="outTAD", .(label, CNA, N, value)] 
+  
+CNA_sel = CNA_dt[group=="2"]
+CNA_sel = CNA_sel[overlapsAny(GRanges(CNA_sel), tads)]
+CNA_sel[, chrom := seqnames]
+# CNA_sel[, .(acrossTADs = sum(overlapsAny(GRanges(.SD), tads) & !overlapsAny(GRanges(.SD), tads, type="within")), N=nrow(.SD)), by=c("label", "CNA", "chrom")][, .(sum(acrossTADs)/sum(N)), by=c("label", "CNA")]
+
+# require(bootstrap)
+# 
+# theta = function(x, xdata, tads){
+#   tmp = with(xdata[x,], GRanges(seqnames, IRanges(start, end)))
+#   tmp = tmp[overlapsAny(tmp, tads),]
+#   tmp = data.table(T = length(tmp), N = sum(!overlapsAny(tmp, tads, type="within")))
+#   return(tmp)
+#   }
+# # testset = CNA_sel[seqnames=="chr1" & CNA=="DEL" & type=="Primary",]
+# # testset[, c(rbindlist(bootstrap(seq_len(.N), 10, theta, .SD, tads)$thetastar)), by=c("label", "CNA", "chrom")]
+# 
+tab = data.table(as.data.frame(seqinfo(genes)), keep.rownames = "seqnames", key="seqnames")
+setkey(CNA_sel, seqnames)
+CNA_sel[tab, seqlengths := seqlengths]
+# 
+# set.seed(42)
+# CNA_sel[, c(rbindlist(bootstrap(seq_len(.N), 10, theta, .SD, tads)$thetastar)), by=c("label", "CNA", "chrom")]
+
+setkeyv(CNA_sel, c("label", "CNA", "chrom"))
+
+if( !file.exists("NatGenFig1_10000.rds") ){
+  set.seed(42)
+  res = CNA_sel[, rbindlist(lapply(1:10000,
+                                   function(i){
+                                     if( i==1 ) print(.GRP)
+                                     tmp = with(.SD, GRanges(seqnames, IRanges(start=sample(seq(5e4, unique(seqlengths), 5e4), nrow(.SD)), width=width)))
+                                     all = length(tmp)
+                                     tmp = tmp[overlapsAny(tmp, tads),]
+                                     tmp = data.table(Across = sum(!overlapsAny(tmp, tads, type="within")), In = length(tmp), All = all, I = i)
+                                     return(tmp)
+                                   })), by=c("label", "CNA", "chrom")]
+  save(res, file = "NatGenFig1_10000.rds")
+}else{
+  res = readRDS("NatGenFig1_10000.rds")  
+}
+pl = res[, .(sum(Across), sum(All)), by=c("label", "CNA", "I")]
+pl[, `:=`(label = factor(label, levels=paste(rep(c("FC", "BM"), each=2), c("Primary", "Metastasis"), sep="_")))]
+tab = pl[, .(AVG=mean(V1), MED=median(V1), PRC=mean(V1/V2), SD=sd(V1/V2)), by=c("label", "CNA")]
+setkeyv(tab_ref, c("label", "CNA"))
+setkeyv(tab, c("label", "CNA"))
+tab_ref[tab, Zscore := (value-PRC)/SD]
+tab_ref[, Pvalue := 2*pnorm(-abs(Zscore)), by=key(tab_ref)][, Signif := symnum(Pvalue,
+                                                                               cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+                                                                               symbols = c("****", "***", "**", "*", "ns"))]
+gg = ggplot(pl, aes(x=V1, col=CNA, fill=CNA)) +
+  ggtitle("Analysis as in Nature Genetics Figure 1C",
+          subtitle="Observed (black) and expected distribution (histograms) of CNAs across TADs. The expected distribution is based on randomly shuffled CNAs.") +
+  geom_vline(data=tab, aes(xintercept=AVG, col=CNA), linetype="dashed", lwd=1, show.legend = FALSE) +
+  geom_text(data=tab, aes(x=AVG, label=percent(PRC)), y=Inf, hjust=1.25, vjust=1.25, show.legend = FALSE) +
+  geom_histogram(aes(y=..density..), bins=50, alpha=0.25) +
+  geom_density(fill=NA, lwd=1) +
+  geom_segment(data=tab_ref, aes(x=N, xend=N, y=0, yend=0.025), col="black") +
+  geom_text_repel(data=tab_ref, aes(x=N, label=paste(percent(value), Signif, sep="\n")), y=0.025, vjust=-1, col="grey25") +
+  scale_fill_lancet(alpha = 0.75) + scale_colour_lancet(alpha = 0.75) +
+  facet_wrap(CNA~label, scales="free", ncol=3) +
+  theme_bw() + guides(text=FALSE)
+ggsave(gg, filename = "A549_CNAs_TADs_NatGenFig1C.png", units = "in", width = 16, height = 8, dpi = 300)
+```
+
+```{r NatGenFig1_Merged}
+tads = list.files(file.path(hic.folder, "juicer/arrowhead/"), pattern="_25000_blocks.bedpe$")
+tads = setNames(tads, gsub("_25000_blocks.bedpe", "", tads))
+tads = rbindlist(lapply(tads, function(x) fread(file.path(hic.folder, "juicer", "arrowhead", x), skip=2)), idcol="name")
+tads[, as.list(summary(V3-V2)), by="name"]
+tads = unique(with(tads, GRanges(V1, IRanges(V2, V3), res=name)))
+tads = keepSeqlevels(tads, chromosomes, pruning.mode = "coarse")
+
+CNA_dt = rbindlist(lapply(CNAs, as.data.frame))
+CNA_dt[, group := cut(width-1, breaks = c(-Inf, 2e6, 4e6, 8e6, 2e7, 5e7, 1e8, 2.5e8, Inf), labels = c("2", "4", "8", "20", "50", "100", "250", "250+"))]
+
+CNA_sel = CNA_dt[group=="2"]
+CNA_sel = CNA_sel[overlapsAny(GRanges(CNA_sel), tads)]
+CNA_sel[, inTAD := overlapsAny(GRanges(CNA_sel), tads, type="within")]
+
+pl = melt.data.table(CNA_sel[, .(inTAD=sum(inTAD)/.N, outTAD=1-sum(inTAD)/.N, N=nrow(.SD)-sum(inTAD)), by=c("type", "CNA")], id.vars = c("type", "CNA", "N"))
+pl[, pos := 1-(cumsum(value)-value/2), by=c("type", "CNA")]
+pl[, `:=`(type = factor(type, levels=c("Primary", "Metastasis")))]
+gg = ggplot(pl, aes(x=as.factor(1), y=value, fill=variable)) +
+  ggtitle("Analysis as in Nature Genetics Figure 1B (merged metastases)",
+          subtitle="The percentage of short-range CNAs (length ≤ 2 Mb) across TADs (orange) and within TADs (blue) for different CNA types.") +
+  geom_bar(stat="identity", position="stack", colour="black") +
+  facet_grid(CNA~type, switch = "both") +
+  scale_fill_d3(alpha = 0.75, label=c("Within TAD", "Across TADs")) +
+  geom_text(aes(y=pos, label=percent(value)), x=1.2, size=3, family="Helvetica", colour="black") +
+  coord_polar(theta = "y") + theme_void() + theme(title = element_text(family="Helvetica", colour="black"),
+                                                  strip.text = element_text(family="Helvetica", colour="black"),
+                                                  legend.text = element_text(family="Helvetica", colour="black")) +
+  guides(fill=guide_legend(title = element_blank()))
+ggsave(gg, filename = "A549_CNAs_TADs_NatGenFig1B_merged.png", units = "in", width = 10, height = 10, dpi = 300)
+ggsave(gg, filename = "A549_CNAs_TADs_panel2.pdf", width = 10, height = 8, device = cairo_pdf)
+
+tab_ref = pl[variable=="outTAD", .(type, CNA, N, value)] 
+  
+CNA_sel = CNA_dt[group=="2"]
+CNA_sel = CNA_sel[overlapsAny(GRanges(CNA_sel), tads)]
+CNA_sel[, chrom := seqnames]
+# CNA_sel[, .(acrossTADs = sum(overlapsAny(GRanges(.SD), tads) & !overlapsAny(GRanges(.SD), tads, type="within")), N=nrow(.SD)), by=c("type", "CNA", "chrom")][, .(sum(acrossTADs)/sum(N)), by=c("type", "CNA")]
+
+# require(bootstrap)
+# 
+# theta = function(x, xdata, tads){
+#   tmp = with(xdata[x,], GRanges(seqnames, IRanges(start, end)))
+#   tmp = tmp[overlapsAny(tmp, tads),]
+#   tmp = data.table(T = length(tmp), N = sum(!overlapsAny(tmp, tads, type="within")))
+#   return(tmp)
+#   }
+# # testset = CNA_sel[seqnames=="chr1" & CNA=="DEL" & type=="Primary",]
+# # testset[, c(rbindlist(bootstrap(seq_len(.N), 10, theta, .SD, tads)$thetastar)), by=c("type", "CNA", "chrom")]
+# 
+tab = data.table(as.data.frame(seqinfo(genes)), keep.rownames = "seqnames", key="seqnames")
+setkey(CNA_sel, seqnames)
+CNA_sel[tab, seqlengths := seqlengths]
+# 
+# set.seed(42)
+# CNA_sel[, c(rbindlist(bootstrap(seq_len(.N), 10, theta, .SD, tads)$thetastar)), by=c("type", "CNA", "chrom")]
+
+setkeyv(CNA_sel, c("type", "CNA", "chrom"))
+
+if( !file.exists("NatGenFig1_10000_merged.rds") ){
+  set.seed(42)
+  res = CNA_sel[, rbindlist(lapply(1:10000,
+                                   function(i){
+                                     if( i==1 ) print(.GRP)
+                                     tmp = with(.SD, GRanges(seqnames, IRanges(start=sample(seq(5e4, unique(seqlengths), 5e4), nrow(.SD)), width=width)))
+                                     all = length(tmp)
+                                     tmp = tmp[overlapsAny(tmp, tads),]
+                                     tmp = data.table(Across = sum(!overlapsAny(tmp, tads, type="within")), In = length(tmp), All = all, I = i)
+                                     return(tmp)
+                                   })), by=c("type", "CNA", "chrom")]
+  save(res, file = "NatGenFig1_10000_merged.rds")
+}else{
+  res = readRDS("NatGenFig1_10000_merged.rds")  
+}
+pl = res[, .(sum(Across), sum(All)), by=c("type", "CNA", "I")]
+pl[, `:=`(type = factor(type, levels=c("Primary", "Metastasis")))]
+tab = pl[, .(AVG=mean(V1), MED=median(V1), PRC=mean(V1/V2), SD=sd(V1/V2)), by=c("type", "CNA")]
+setkeyv(tab_ref, c("type", "CNA"))
+setkeyv(tab, c("type", "CNA"))
+tab_ref[tab, Zscore := (value-PRC)/SD]
+tab_ref[, Pvalue := 2*pnorm(-abs(Zscore)), by=key(tab_ref)][, Signif := symnum(Pvalue,
+                                                                               cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+                                                                               symbols = c("****", "***", "**", "*", "ns"))]
+gg = ggplot(pl, aes(x=V1, col=CNA, fill=CNA)) +
+  ggtitle("Analysis as in Nature Genetics Figure 1C (merged metastases)",
+          subtitle="Observed (black) and expected distribution (histograms) of CNAs across TADs. The expected distribution is based on randomly shuffled CNAs.") +
+  geom_vline(data=tab, aes(xintercept=AVG, col=CNA), linetype="dashed", lwd=1, show.legend = FALSE) +
+  geom_text(data=tab, aes(x=AVG, label=percent(PRC)), y=Inf, hjust=1.25, vjust=1.25, show.legend = FALSE) +
+  geom_histogram(aes(y=..density..), bins=50, alpha=0.25) +
+  geom_density(fill=NA, lwd=1) +
+  geom_segment(data=tab_ref, aes(x=N, xend=N, y=0, yend=0.025), col="black") +
+  geom_text_repel(data=tab_ref, aes(x=N, label=paste(percent(value), Signif, sep="\n")), y=0.025, vjust=-1, col="grey25") +
+  scale_fill_lancet(alpha = 0.75) + scale_colour_lancet(alpha = 0.75) +
+  facet_wrap(CNA~type, scales="free", ncol=2) +
+  theme_bw() + guides(text=FALSE)
+ggsave(gg, filename = "A549_CNAs_TADs_NatGenFig1C_merged.png", units = "in", width = 12, height = 8, dpi = 300)
+```
+
+```{r NatGenFig4}
+lads = fread(file.path("extra", "LADatlas_100kbBin_LP160718.bed.gz"))
+lads_gr = with(lads[grepl("cLAD|ciLAD", V6),], GRanges(V1, IRanges(V2, V3), name=V6))
+
+CNAs_all = unlist(GRangesList(CNAs))
+
+tab = data.table(as.data.frame(CNAs_all, row.names = NULL))
+tab[, Index := seq_len(nrow(tab))]
+setkey(tab, Index)
+overlaps = as.data.table(findOverlaps(CNAs_all, lads_gr))
+overlaps[, overlap := width(pintersect(CNAs_all[queryHits,], lads_gr[subjectHits,]))]
+overlaps[, `:=`(LAD = lads_gr[subjectHits,]$name, Size = width(CNAs_all[queryHits,]))]
+overlaps = overlaps[, .(overlap = sum(overlap)), by=c("queryHits", "Size", "LAD")]
+overlaps[, LAD_portion := overlap/Size]
+overlaps = overlaps[LAD_portion>0.5,]
+setkey(overlaps, queryHits)
+
+tab[overlaps, LAD := lAD][is.na(LAD), LAD := "ncRegions"]
+pl = tab[, .N, by=c("type", "CNA", "LAD")][, .(LAD, N=N, P=N/sum(N)), by=c("type", "CNA")]
+pl[, `:=`(type = factor(type, levels=c("Primary", "Metastasis")), LAD = factor(LAD, levels=rev(c("cLAD", "ciLAD", "ncRegions"))))]
+gg = ggplot(pl, aes(x=type, y=P, fill=LAD)) +
+  ggtitle("CNAs encompassing constitutive LADs (cLAD), inter-LADs (ciLAD) or non-constitutive regions (ncRegions)",
+          subtitle = "CNAs were assigned to each group based on the feature coverage of the CNA region (>=50%)") +
+  geom_bar(stat="identity", position="stack", col="black") +
+  scale_x_discrete("") + scale_y_continuous("Fraction of CNAs") +
+  scale_fill_locuszoom() +
+  facet_wrap(~CNA, scales="free_y") + 
+  theme_pubr() + theme(strip.background = element_blank(), legend.position = "bottom") +
+  guides(fill=guide_legend(title = element_blank(), reverse = TRUE))
+ggsave(gg, filename = "A549_CNAs_LADs_NatGenFig4D_merged.png", units = "in", width = 12, height = 8, dpi = 300)
+```
+
+```{r readHiCloops}
+loops = list.files(file.path(hic.folder, "juicer", "hiccup"), pattern="merged_loops.bedpe$")
+loops = setNames(loops, gsub("_merged_loops.bedpe", "", loops))
+loops = rbindlist(lapply(loops, function(x) fread(file.path(hic.folder, "juicer", "hiccup", x), skip=2)), idcol="name")
+
+# # Check visually
+# loops[, GRP := .GRP, by="name"]
+# ggplot(loops, aes(x=V2, xend=V3, y=GRP, yend=GRP)) + geom_segment() + facet_wrap(~V1, scales="free_x", ncol=2)
+
+loops = unique(with(loops, GRanges(V1, IRanges((V2+V3)/2, (V5+V6)/2), res=name)))
+loops = keepSeqlevels(loops, chromosomes, pruning.mode = "coarse")
+pl_loops = data.table(as.data.frame(loops))
+
+FC_set = split(CNA_FC, paste(CNA_FC$type, CNA_FC$CNA, sep="_"))
+names(FC_set) = paste("FC", names(FC_set), sep="_")
+BM_set = split(CNA_BM, paste(CNA_BM$type, CNA_BM$CNA, sep="_"))
+names(BM_set) = paste("BM", names(BM_set), sep="_")
+
+tab = rbindlist(lapply(c(FC_set, BM_set), function(x) data.table(n=length(x)*2,
+                                            p=sum(width(reduce(loops)))/2864785220, # Effective size taken from DeepTools
+                                            inLoop=sum(countOverlaps(reduce(loops), c(resize(x, 1, fix="start"), resize(x, 1, fix="end")))))), idcol="Set")
+tab[, pval := prop.test(x=inLoop, n=n, p=p, alternative = "greater")$p.value, by="Set"]
+tab[, label := symnum(pval, cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), symbols = c("****", "***", "**", "*", "ns"))]
+gg = ggplot(tab, aes(x=Set, y=inLoop/n)) + geom_hline(yintercept = unique(tab[,p]), lty=2, col="grey25") + geom_bar(stat="identity", position="identity", col="grey25", fill="grey75")  + geom_text(aes(label=label), vjust=-1) + labs(x="", y="Fraction of CNAs in Loops") + theme_bw()
+ggsave(gg, filename = "A549_CNAs_in_loops.png", units = "in", width = 12, height = 6, dpi = 300)
+
+# 
+pl = lapply(CNAs,
+            function(x)
+              data.table(as.data.frame(mcols(c(x, x))),
+                         distance = as.data.table(distanceToNearest(c(resize(x, 1, fix="start"), resize(x, 1, fix="end")),
+                                                                    c(resize(loops, 1, fix="start"), resize(loops, 1, fix="end"))))[, distance+1]))
+
+pl[[1]][, `:=`(type = factor(type, levels=c("Primary", "Metastasis")), sample = factor(sample, levels=paste0("MN", 1:60)))]
+pl = rbindlist(pl, idcol="Set")
+pl[, Set := factor(Set, levels=c("FullCohort", "BM"))]
+
+gg = ggplot(pl, aes(x=distance, fill=CNA)) + geom_histogram(bins = 50, alpha=0.75) + scale_x_log10() + scale_fill_brewer(palette="Set1") + facet_grid(Set~type+CNA) + theme_bw() + labs(x = "Distance to neatest Loop boundary (kb)", y = "Count") + guides(fill=guide_legend(title = ""))
+ggsave(gg, filename = "A549_CNAs_loops_FC_histogram.png", units = "in", width = 12, height = 6, dpi = 300)
+
+gg = ggplot(pl, aes(x=type, y=distance/1e3, fill=CNA)) + geom_boxplot(alpha=0.75, notch=TRUE) + scale_y_log10() + facet_grid(~Set, scales = "free_x") + scale_fill_brewer(palette="Set1") + theme_bw() + labs(x="", y="Distance to neatest Loop boundary (kb)") + guides(fill=guide_legend(title = "CNA Type"))
+ggsave(gg, filename = "A549_CNAs_loops_allSets.png", units = "in", width = 10, height = 6, dpi = 300)
+
+gg = ggplot(pl[Set=="FullCohort",], aes(x=type, y=distance/1e3)) + geom_boxplot(alpha=0.75, notch=TRUE, aes(fill=CNA)) + scale_y_log10() + facet_wrap(~CNA) + scale_fill_brewer(palette="Set1") + theme_bw() + labs(x = "", y="Distance to neatest Loop boundary (kb)") + guides(fill=guide_legend(title = "")) + stat_compare_means(comparisons = list(c("Primary", "Metastasis")))
+ggsave(gg, filename = "A549_CNAs_loops_FC_Type.png", units = "in", width = 10, height = 8, dpi = 300)
+
+gg = ggplot(pl[Set=="FullCohort",], aes(x=CNA, y=distance/1e3, fill=CNA)) + geom_boxplot(alpha=0.75, notch=TRUE) + scale_y_log10() + scale_fill_brewer(palette="Set1") + theme_bw() + labs(x = "", y="Distance to neatest Loop boundary (kb)") + guides(fill=guide_legend(title = "")) + stat_compare_means(comparisons = list(c("AMP", "DEL")), inherit.aes = FALSE)
+ggsave(gg, filename = "A549_CNAs_loops_BM_Type.png", units = "in", width = 8, height = 8, dpi = 300)
+
+# By Set
+CNA_FC_AMP = coverage(CNA_FC[CNA_FC$CNA=="AMP",])/length(unique(paste(CNA_FC$type, CNA_FC$sample)))
+CNA_FC_DEL = coverage(CNA_FC[CNA_FC$CNA=="DEL",])/length(unique(paste(CNA_FC$type, CNA_FC$sample)))
+CNA_BM_AMP = coverage(CNA_BM[CNA_BM$CNA=="AMP",])/length(unique(paste(CNA_BM$type, CNA_BM$sample)))
+CNA_BM_DEL = coverage(CNA_BM[CNA_BM$CNA=="DEL",])/length(unique(paste(CNA_BM$type, CNA_BM$sample)))
+
+pl_cnas = rbindlist(lapply(list(CNA_FC_AMP=CNA_FC_AMP, CNA_FC_DEL=CNA_FC_DEL, CNA_BM_AMP=CNA_BM_AMP, CNA_BM_DEL=CNA_BM_DEL),
+                           function(x)
+                             data.table(as.data.frame(GRanges(x)))[score>0, .(N=sum(score)), by=c("seqnames", "start", "end")]), idcol = "Dataset")
+pl_cnas[, c("Dataset", "Type") := tstrsplit(Dataset, "_")[2:3]]
+
+pl_cnas[Type=="DEL", N := -N][, Type := factor(Type, levels=c("DEL", "AMP"))]
+
+gg = ggplot() +
+  ggtitle("Chromosome 10") +
+  geom_rect(data=pl_cnas[seqnames=="chr10",], aes(xmin=start, xmax=end, ymin=0, ymax=N, fill=Type)) +
+  # geom_segment(data=pl_cnas[seqnames=="chr10",], aes(x=start, xend=end, y=N, yend=N, col=paste(Type, Dataset))) +
+  geom_curve(data=pl_loops[seqnames=="chr10",], aes(x = start, xend = end, y = 0, yend = 0), col="black") +
+  scale_x_continuous("Genomic positon (bp)") + scale_y_continuous("CNA occurence (Fraction of datasets)") +
+  scale_fill_tableau(palette="Classic Blue-Red 6") +
+  facet_wrap(~Dataset, ncol=1) +
+  theme_bw() + theme(legend.position = "bottom") + guides(fill=guide_legend(title="CNA type"))
+ggsave(gg, filename = "A549_loops_CNAs_chr10.png", units = "in", width = 12, height = 6, dpi = 300)
+
+gg = ggplot() +
+  geom_curve(data=pl_loops, aes(x = start, xend = end, y = 0, yend = 0), col="grey25") +
+  geom_segment(data=pl_cnas, aes(x=start, xend=end, y=N, yend=N, col=paste(Type, Dataset))) +
+  scale_x_continuous("Genomic positon (bp)") + scale_y_continuous("CNA occurence (Fraction of datasets)") +
+  scale_colour_tableau(palette="Classic Blue-Red 12") +
+  facet_wrap(~seqnames, ncol=4, scales="free_x") +
+  theme_bw() + theme(legend.position = "bottom") + guides(colour=guide_legend(title="Dataset and CNA type"))
+ggsave(gg, filename = "A549_loops_CNAs.png", units = "in", width = 20, height = 10, dpi = 144)
+
+# By Type
+CNA_Primary_AMP = coverage(CNA_FC[CNA_FC$type=="Primary" & CNA_FC$CNA=="AMP",])/length(unique(CNA_FC$sample))
+CNA_Primary_DEL = coverage(CNA_FC[CNA_FC$type=="Primary" & CNA_FC$CNA=="DEL",])/length(unique(CNA_FC$sample))
+CNA_Metastasis_AMP = coverage(CNA_FC[CNA_FC$type=="Metastasis" & CNA_FC$CNA=="AMP",])/length(unique(CNA_FC$sample))
+CNA_Metastasis_DEL = coverage(CNA_FC[CNA_FC$type=="Metastasis" & CNA_FC$CNA=="DEL",])/length(unique(CNA_FC$sample))
+
+pl_cnas = rbindlist(lapply(list(CNA_Primary_AMP=CNA_Primary_AMP, CNA_Primary_DEL=CNA_Primary_DEL,
+                                CNA_Metastasis_AMP=CNA_Metastasis_AMP, CNA_Metastasis_DEL=CNA_Metastasis_DEL),
+                           function(x)
+                             data.table(as.data.frame(GRanges(x)))[score>0, .(N=sum(score)), by=c("seqnames", "start", "end")]), idcol = "Dataset")
+pl_cnas[, c("Dataset", "Type") := tstrsplit(Dataset, "_")[2:3]]
+
+pl_cnas[Type=="DEL", N := -N][, `:=`(Dataset = factor(Dataset, levels=c("Primary", "Metastasis")), Type = factor(Type, levels=c("DEL", "AMP")))]
+
+gg = ggplot() +
+  ggtitle("Chromosome 10") +
+  geom_rect(data=pl_cnas[seqnames=="chr10",], aes(xmin=start, xmax=end, ymin=0, ymax=N, fill=Type)) +
+  # geom_segment(data=pl_cnas[seqnames=="chr10",], aes(x=start, xend=end, y=N, yend=N, col=paste(Type, Dataset))) +
+  geom_curve(data=pl_loops[seqnames=="chr10",], aes(x = start, xend = end, y = 0, yend = 0), col="black") +
+  scale_x_continuous("Genomic positon (bp)") + scale_y_continuous("CNA occurence (Fraction of datasets)") +
+  scale_fill_tableau(palette="Classic Blue-Red 6") +
+  facet_wrap(~Dataset, ncol=1) +
+  theme_bw() + theme(legend.position = "bottom") + guides(fill=guide_legend(title="CNA type"))
+ggsave(gg, filename = "A549_loops_CNAs_Type_chr10.png", units = "in", width = 12, height = 6, dpi = 300)
+
+gg = ggplot() +
+  geom_curve(data=pl_loops, aes(x = start, xend = end, y = 0, yend = 0), col="grey25") +
+  geom_segment(data=pl_cnas, aes(x=start, xend=end, y=N, yend=N, col=paste(Type, Dataset))) +
+  scale_x_continuous("Genomic positon (bp)") + scale_y_continuous("CNA occurence (Fraction of datasets)") +
+  scale_colour_tableau(palette="Classic Blue-Red 12") +
+  facet_wrap(~seqnames, ncol=4, scales="free_x") +
+  theme_bw() + theme(legend.position = "bottom") + guides(colour=guide_legend(title="Dataset and CNA type"))
+ggsave(gg, filename = "A549_loops_CNAs_Type.png", units = "in", width = 20, height = 10, dpi = 144)
+
+
+pl_cnas = rbindlist(lapply(list(CNA_AMP=CNA_Primary_AMP-CNA_Metastasis_AMP, CNA_DEL=CNA_Primary_DEL-CNA_Metastasis_DEL),
+                           function(x)
+                             data.table(as.data.frame(GRanges(x)))[, .(N=sum(score)), by=c("seqnames", "start", "end")]), idcol = "Dataset")
+pl_cnas[, c("Type") := tstrsplit(Dataset, "_")[2]]
+
+pl_cnas[, Type := factor(Type, levels=c("DEL", "AMP"))]
+
+gg = ggplot() +
+  geom_curve(data=pl_loops, aes(x = start, xend = end, y = 0, yend = 0), col="grey25") +
+  geom_segment(data=pl_cnas, aes(x=start, xend=end, y=N, yend=N, col=Type)) +
+  scale_x_continuous("Genomic positon (bp)") + scale_y_continuous("Delta occurrence (Primary - Metastasis)") +
+  scale_colour_tableau(palette="Classic Blue-Red 6") +
+  facet_wrap(~seqnames, ncol=4, scales="free_x") +
+  theme_bw() + theme(legend.position = "bottom") + guides(colour=guide_legend(title="CNA type"))
+ggsave(gg, filename = "A549_loops_CNAs_Type_Delta.png", units = "in", width = 20, height = 10, dpi = 144)
+```
+
+```{r TADandLoopsMetaprofiles}
+tads = fread(file.path(hic.folder, "juicer/arrowhead/", "A549_ENCSR662QKG_pooled_5000_blocks.bedpe"), skip=2)
+tads = with(tads, GRanges(V1, IRanges(V2, V3)))
+
+tads = keepSeqlevels(tads, chromosomes, pruning.mode = "coarse")
+
+CNA_split = split(CNAs[[1]], CNAs[[1]]$type)
+CNA_split = c(CNA_split, CNAs[2])
+CNA_split = lapply(CNA_split, function(x) c(resize(x, 1, fix="start"), resize(x, 1, fix="end")))
+
+tad_boundaries = list(Start=unique(resize(reduce(tads), 1, fix="start")), End=unique(resize(reduce(tads), 1, fix="end")))
+
+winSize = 1e6
+pl = rbindlist(lapply(CNA_split,
+                      function(x){
+                        rbindlist(lapply(tad_boundaries,
+                                         function(ref){
+                                           tmp = resize(ref, winSize, fix="center")
+                                           overlaps = as.data.table(findOverlaps(tmp, x))
+                                           overlaps[, `:=`(invert = ifelse(start(ref[queryHits,])>start(x[subjectHits,]), TRUE, FALSE),
+                                                           distance = distance(ref[queryHits,], x[subjectHits,])+1)]
+                                           overlaps[invert==TRUE, distance := -distance]
+                                           overlaps[, distBin := cut(distance, breaks = seq(-(winSize/2 + winSize/200), (winSize/2 + winSize/200), length.out = 102),
+                                                                     labels = seq(-winSize/2e3, winSize/2e3, length.out = 101), include.lowest = TRUE)]
+                                           overlaps = overlaps[, .N, by=c("queryHits", "distBin")] 
+                                           overlaps = dcast.data.table(overlaps, queryHits~distBin, value.var = "N", fill = 0)[, -1, with=FALSE]
+                                           overlaps = colMeans(overlaps/rowSums(overlaps))
+                                           # overlaps = colMeans(overlaps)
+                                           return(as.data.table(overlaps, keep.rownames = TRUE))
+                                         }), idcol = "Position")
+                      }), idcol = "Type")
+pl[, `:=`(rn = as.numeric(rn), Type = factor(Type, levels=c("Primary", "Metastasis", "BM")), Position = factor(Position, levels=c("Start", "End")))]
+
+gg1 = ggplot(pl, aes(x=rn, y=overlaps, group=Type, col=Type)) +
+  ggtitle("CNAs around TAD boundaries") +
+  geom_line(lwd=0.75) + geom_point(alpha=1, size=0.75) +
+  scale_x_continuous("Distance to TAD boundary (kb)", breaks=seq(-winSize/2e3, winSize/2e3, winSize/2e4)) +
+  scale_y_continuous("Average CNA density") +
+  scale_colour_lancet(alpha=0.5) +
+  facet_wrap(~Position, strip.position = "top", nrow = 1) +
+  theme_few() + theme(strip.text = element_text(family="Helvetica", colour="black"),
+                      legend.text = element_text(family="Helvetica", colour="black"))
+
+gg1.1 = ggplot(pl, aes(x=rn, y=overlaps, group=Type, col=Type)) +
+  ggtitle("CNAs around TAD boundaries") +
+  geom_smooth(se=FALSE, span=0.1) +
+  scale_x_continuous("Distance to TAD boundary (kb)", breaks=seq(-winSize/2e3, winSize/2e3, winSize/2e4)) +
+  scale_y_continuous("Average CNA density") +
+  scale_colour_lancet(alpha=0.5) +
+  facet_wrap(~Position, strip.position = "top", nrow = 1) +
+  theme_few() + theme(strip.text = element_text(family="Helvetica", colour="black"),
+                      legend.text = element_text(family="Helvetica", colour="black"))
+
+for(pos in c("Start", "End")){
+  gg = ggplot(pl[Type!="BM" & Position==pos], aes(x=rn, y=overlaps, group=Type, col=Type)) +
+    ggtitle("CNAs around TAD boundaries") +
+    geom_smooth(se=FALSE, span=0.1) +
+    scale_x_continuous("Distance to TAD boundary (kb)", breaks=seq(-winSize/2e3, winSize/2e3, winSize/2e4)) +
+    scale_y_continuous("Average CNA density") +
+    scale_colour_lancet(alpha=0.75) +
+    facet_wrap(~Position) +
+    theme_few() + theme(strip.text = element_text(family="Helvetica", colour="black"),
+                        legend.text = element_text(family="Helvetica", colour="black"))
+    ggsave(gg, filename = paste0("A549_CNAs_TADboundaries_", pos, ".pdf"), width = 8, height = 4, device = cairo_pdf)
+}
+
+
+loop_anchors = list(Start=unique(resize(loops, 1, fix="start")), End=unique(resize(loops, 1, fix="end")))
+
+winSize=1e6
+pl = rbindlist(lapply(CNA_split,
+                      function(x){
+                        rbindlist(lapply(loop_anchors,
+                                         function(ref){
+                                           tmp = resize(ref, winSize, fix="center")
+                                           overlaps = as.data.table(findOverlaps(tmp, x))
+                                           overlaps[, `:=`(invert = ifelse(start(ref[queryHits,])>start(x[subjectHits,]), TRUE, FALSE),
+                                                           distance = distance(ref[queryHits,], x[subjectHits,])+1)]
+                                           overlaps[invert==TRUE, distance := -distance]
+                                           overlaps[, distBin := cut(distance, breaks = seq(-(winSize/2 + winSize/200), (winSize/2 + winSize/200), length.out = 102),
+                                                                     labels = seq(-winSize/2e3, winSize/2e3, length.out = 101), include.lowest = TRUE)]
+                                           overlaps = overlaps[, .N, by=c("queryHits", "distBin")] 
+                                           overlaps = dcast.data.table(overlaps, queryHits~distBin, value.var = "N", fill = 0)[, -1, with=FALSE]
+                                           overlaps = colMeans(overlaps/rowSums(overlaps))
+                                           # overlaps = colMeans(overlaps)
+                                           return(as.data.table(overlaps, keep.rownames = TRUE))
+                                         }), idcol = "Position")
+                      }), idcol = "Type")
+pl[, `:=`(rn = as.numeric(rn), Type = factor(Type, levels=c("Primary", "Metastasis", "BM")), Position = factor(Position, levels=c("Start", "End")))]
+
+gg2 = ggplot(pl, aes(x=rn, y=overlaps, group=Type, col=Type)) +
+  ggtitle("CNAs around Loop anchors") +
+  geom_line(lwd=0.75) + geom_point(alpha=1, size=0.75) +
+  scale_x_continuous("Distance to Loop anchor (kb)", breaks=seq(-winSize/2e3, winSize/2e3, winSize/2e4)) +
+  scale_y_continuous("Average CNA density") +
+  scale_colour_lancet(alpha=0.5) +
+  facet_wrap(~Position, strip.position = "top", nrow = 1) +
+  theme_few() + theme(strip.text = element_text(family="Helvetica", colour="black"),
+                      legend.text = element_text(family="Helvetica", colour="black"))
+
+gg2.1 = ggplot(pl, aes(x=rn, y=overlaps, group=Type, col=Type)) +
+  ggtitle("CNAs around Loop anchors") +
+  geom_smooth(se=FALSE, span=0.1) +
+  scale_x_continuous("Distance to Loop anchor (kb)", breaks=seq(-winSize/2e3, winSize/2e3, winSize/2e4)) +
+  scale_y_continuous("Average CNA density") +
+  scale_colour_lancet(alpha=0.5) +
+  facet_wrap(~Position, strip.position = "top", nrow = 1) +
+  theme_few() + theme(strip.text = element_text(family="Helvetica", colour="black"),
+                      legend.text = element_text(family="Helvetica", colour="black"))
+
+for(pos in c("Start", "End")){
+  gg = ggplot(pl[Type!="BM" & Position==pos], aes(x=rn, y=overlaps, group=Type, col=Type)) +
+  ggtitle("CNAs around Loop anchors") +
+  geom_smooth(se=FALSE, span=0.1) +
+  scale_x_continuous("Distance to Loop anchor (kb)", breaks=seq(-winSize/2e3, winSize/2e3, winSize/2e4)) +
+  scale_y_continuous("Average CNA density") +
+  scale_colour_lancet(alpha=0.75) +
+  facet_wrap(~Position, strip.position = "top", nrow = 1) +
+  theme_few() + theme(strip.text = element_text(family="Helvetica", colour="black"),
+                      legend.text = element_text(family="Helvetica", colour="black"))
+    ggsave(gg, filename = paste0("A549_CNAs_LoopAnchors_", pos, ".pdf"), width = 8, height = 4, device = cairo_pdf)
+}
+
+
+gg = ggarrange(gg1, gg2, nrow=2, common.legend = TRUE, legend = "bottom")
+ggsave(gg, filename = "A549_CNAs_TADs_Loops.png", units = "in", width = 12, height = 6)
+ggsave(gg, filename = "A549_CNAs_TADs_Loops_panel1.pdf", width = 12, height = 8, device = cairo_pdf)
+gg = ggarrange(gg1.1, gg2.1, nrow=2, common.legend = TRUE, legend = "bottom")
+ggsave(gg, filename = "A549_CNAs_TADs_Loops_smoothed_panel1.pdf", width = 12, height = 8, device = cairo_pdf)
+
+# ChIP-seq
+chip_files = list.files(file.path(chip.folder, "results", "macs"), pattern="summits.bed$", full.names = TRUE)
+names(chip_files) = as.data.table(tstrsplit(basename(chip_files), "_")[4:6])[, paste(V1, V2, V3, sep="_")]
+chip_peaks = GRangesList(lapply(chip_files, import.bed))
+seqlevelsStyle(chip_peaks) <- "UCSC"
+chip_peaks = lapply(chip_peaks, function(x) keepSeqlevels(x, chromosomes, pruning.mode = "coarse"))
+chip_peaks = chip_peaks[sapply(chip_peaks, length)>=1000] # Select only experiments with more than 1000 peaks
+
+winSize=1e6
+pl = rbindlist(lapply(CNA_split,
+                      function(x){
+                        rbindlist(lapply(chip_peaks,
+                                         function(ref){
+                                           tmp = resize(ref, winSize, fix="center")
+                                           overlaps = as.data.table(findOverlaps(tmp, x))
+                                           overlaps[, `:=`(invert = ifelse(start(ref[queryHits,])>start(x[subjectHits,]), TRUE, FALSE),
+                                                           distance = distance(ref[queryHits,], x[subjectHits,]))]
+                                           overlaps[invert==TRUE, distance := -distance]
+                                           overlaps[, distBin := cut(distance, breaks = seq(-(winSize/2 + winSize/200), (winSize/2 + winSize/200), length.out = 102),
+                                                                     labels = seq(-winSize/2e3, winSize/2e3, length.out = 101), include.lowest = TRUE)]
+                                           overlaps = overlaps[, .N, by=c("queryHits", "distBin")] 
+                                           overlaps = dcast.data.table(overlaps, queryHits~distBin, value.var = "N", fill = 0)[, -1, with=FALSE]
+                                           overlaps = colMeans(overlaps/rowSums(overlaps))
+                                           # overlaps = colMeans(overlaps)
+                                           return(as.data.table(overlaps, keep.rownames = TRUE))
+                                         }), idcol = "ChIPseq")
+                      }), idcol = "Type")
+pl[, `:=`(rn = as.numeric(rn), Type = factor(Type, levels=c("Primary", "Metastasis", "BM")))]
+pl[, c("Exp", "Target", "Rep") := tstrsplit(ChIPseq, "_")][, Rep := as.numeric(Rep), ]
+pl = pl[, .(overlaps = mean(overlaps)), by=c("Type", "rn", "Target")]
+
+gg = ggplot(pl, aes(x=rn, y=overlaps, col=Type)) +
+  ggtitle("CNAs around ChIP-seq peaks") +
+  geom_line(lwd=0.75) + geom_point(alpha=1, size=0.75) +
+  scale_x_continuous("Distance to peak summit (kb)", breaks=seq(-winSize/2e3, winSize/2e3, length.out = 5)) +
+  scale_y_continuous("Average CNA density") +
+  scale_colour_lancet(alpha=0.5) +
+  facet_wrap(~Target, strip.position = "top", ncol = 5) +
+  theme_few() + theme(strip.text = element_text(family="Helvetica", colour="black"),
+                      legend.text = element_text(family="Helvetica", colour="black"))
+
+ggsave(gg, filename = "A549_CNAs_ChIPseqPeaks.png", units = "in", width = 12, height = 6)
+ggsave(gg, filename = "A549_CNAs_ChIPseqPeaks_panel1.pdf", width = 12, height = 6, device = cairo_pdf)
+
+gg = ggplot(pl, aes(x=rn, y=overlaps, col=Type)) +
+  ggtitle("CNAs around ChIP-seq peaks") +
+  geom_smooth(se=FALSE, span=0.1) +
+  scale_x_continuous("Distance to peak summit (kb)", breaks=seq(-winSize/2e3, winSize/2e3, length.out = 5)) +
+  scale_y_continuous("Average CNA density") +
+  scale_colour_lancet(alpha=0.5) +
+  facet_wrap(~Target, strip.position = "top", ncol = 5) +
+  theme_few() + theme(strip.text = element_text(family="Helvetica", colour="black"),
+                      legend.text = element_text(family="Helvetica", colour="black"))
+
+ggsave(gg, filename = "A549_CNAs_ChIPseqPeaks_smoothed_panel1.pdf", width = 12, height = 6, device = cairo_pdf)
+
+# winSize=1e6
+# pl = rbindlist(lapply(chip_peaks,
+#                       function(x){
+#                         rbindlist(lapply(CNA_split,
+#                                          function(ref){
+#                                            tmp = resize(ref, winSize, fix="center")
+#                                            overlaps = as.data.table(findOverlaps(tmp, x))
+#                                            overlaps[, `:=`(invert = ifelse(start(ref[queryHits,])>start(x[subjectHits,]), TRUE, FALSE),
+#                                                            distance = distance(ref[queryHits,], x[subjectHits,]))]
+#                                            overlaps[invert==TRUE, distance := -distance]
+#                                            overlaps[, distBin := cut(distance, breaks = seq(-(winSize/2 + winSize/200), (winSize/2 + winSize/200), length.out = 102),
+#                                                                      labels = seq(-winSize/2e3, winSize/2e3, length.out = 101), include.lowest = TRUE)]
+#                                            overlaps = overlaps[, .N, by=c("queryHits", "distBin")]
+#                                            overlaps = dcast.data.table(overlaps, queryHits~distBin, value.var = "N", fill = 0)[, -1, with=FALSE]
+#                                            overlaps = colMeans(overlaps/rowSums(overlaps))
+#                                            # overlaps = colMeans(overlaps)
+#                                            return(as.data.table(overlaps, keep.rownames = TRUE))
+#                                          }), idcol = "Type")
+#                       }), idcol = "ChIPseq")
+# pl[, `:=`(rn = as.numeric(rn), Type = factor(Type, levels=c("Primary", "Metastasis", "BM")))]
+# pl[, c("Exp", "Target", "Rep") := tstrsplit(ChIPseq, "_")][, Rep := as.numeric(Rep), ]
+# gg = ggplot(pl, aes(x=rn, y=overlaps, col=Type, shape=as.factor(Rep), group=Exp)) + geom_line() + geom_point() + scale_x_continuous("Distance to CNA boundary (kb)", breaks=seq(-winSize/2e3, winSize/2e3, winSize/2e4)) + scale_y_continuous("Average ChIP peak density") + scale_colour_lancet(alpha=0.5) + facet_wrap(~Target, ncol=5) + theme_bw() + theme(legend.position = "top")
+
+winSize=1e5
+pl = rbindlist(lapply(chip_peaks,
+                      function(x){
+                        rbindlist(lapply(tad_boundaries,
+                                         function(ref){
+                                           tmp = resize(ref, winSize, fix="center")
+                                           overlaps = as.data.table(findOverlaps(tmp, x))
+                                           overlaps[, `:=`(invert = ifelse(start(ref[queryHits,])>start(x[subjectHits,]), TRUE, FALSE),
+                                                           distance = distance(ref[queryHits,], x[subjectHits,]))]
+                                           overlaps[invert==TRUE, distance := -distance]
+                                           overlaps[, distBin := cut(distance, breaks = seq(-(winSize/2 + winSize/200), (winSize/2 + winSize/200), length.out = 102),
+                                                                     labels = seq(-winSize/2e3, winSize/2e3, length.out = 101), include.lowest = TRUE)]
+                                           overlaps = overlaps[, .N, by=c("queryHits", "distBin")] 
+                                           overlaps = dcast.data.table(overlaps, queryHits~distBin, value.var = "N", fill = 0)[, -1, with=FALSE]
+                                           overlaps = colMeans(overlaps/rowSums(overlaps))
+                                           # overlaps = colMeans(overlaps)
+                                           return(as.data.table(overlaps, keep.rownames = TRUE))
+                                         }), idcol = "Position")
+                      }), idcol = "ChIPseq")
+pl[, `:=`(rn = as.numeric(rn), Position = factor(Position, levels=c("Start", "End")))]
+pl[, c("Exp", "Target", "Rep") := tstrsplit(ChIPseq, "_")][, Rep := as.numeric(Rep), ]
+gg = ggplot(pl, aes(x=rn, y=overlaps, col=as.factor(Rep))) + ggtitle("ChIPseq around TAD boundaries") + geom_line() + geom_point() + scale_x_continuous("Distance to TAD boundary (kb)", breaks=seq(-winSize/2e3, winSize/2e3, length.out = 5)) + scale_y_continuous("Average ChIPseq peak density") + scale_colour_lancet(alpha=0.5) + facet_grid(Position~Target) + theme_bw() + theme(legend.position = "bottom")
+ggsave(gg, filename = "A549_ChIPseqPeaks_TADs_check.png", units = "in", width = 20, height = 5)
+
+winSize=1e5
+pl = rbindlist(lapply(chip_peaks,
+                      function(x){
+                        rbindlist(lapply(loop_anchors,
+                                         function(ref){
+                                           tmp = resize(ref, winSize, fix="center")
+                                           overlaps = as.data.table(findOverlaps(tmp, x))
+                                           overlaps[, `:=`(invert = ifelse(start(ref[queryHits,])>start(x[subjectHits,]), TRUE, FALSE),
+                                                           distance = distance(ref[queryHits,], x[subjectHits,]))]
+                                           overlaps[invert==TRUE, distance := -distance]
+                                           overlaps[, distBin := cut(distance, breaks = seq(-(winSize/2 + winSize/200), (winSize/2 + winSize/200), length.out = 102),
+                                                                     labels = seq(-winSize/2e3, winSize/2e3, length.out = 101), include.lowest = TRUE)]
+                                           overlaps = overlaps[, .N, by=c("queryHits", "distBin")] 
+                                           overlaps = dcast.data.table(overlaps, queryHits~distBin, value.var = "N", fill = 0)[, -1, with=FALSE]
+                                           overlaps = colMeans(overlaps/rowSums(overlaps))
+                                           # overlaps = colMeans(overlaps)
+                                           return(as.data.table(overlaps, keep.rownames = TRUE))
+                                         }), idcol = "Position")
+                      }), idcol = "ChIPseq")
+pl[, `:=`(rn = as.numeric(rn), Position = factor(Position, levels=c("Start", "End")))]
+pl[, c("Exp", "Target", "Rep") := tstrsplit(ChIPseq, "_")][, Rep := as.numeric(Rep), ]
+gg = ggplot(pl, aes(x=rn, y=overlaps, col=as.factor(Rep))) + ggtitle("ChIPseq around Loop anchors") + geom_line() + geom_point() + scale_x_continuous("Distance to Loop anchor (kb)", breaks=seq(-winSize/2e3, winSize/2e3, length.out = 5)) + scale_y_continuous("Average ChIPseq peak density") + scale_colour_lancet(alpha=0.5) + facet_grid(Position~Target) + theme_bw() + theme(legend.position = "bottom")
+ggsave(gg, filename = "A549_ChIPseqPeaks_Loops_check.png", units = "in", width = 20, height = 5)
+```
+
+```{r COSMIC}
+cosmic = readRDS("/home/agostif/Projects/GPSeq_analysis/FA/CosmicMutantExport-hg19.rds")
+cosmic_gr = with(cosmic, GRanges(chrom, IRanges(start, width=1)))
+
+CNA_borders = unlist(GRangesList(CNAs))
+
+CNA_borders = c(resize(resize(CNA_borders, 1, fix="start"), 1e5, fix="center"), 
+                resize(resize(CNA_borders, 1, fix="end"), 1e5, fix="center"))
+
+pl = rbindlist(lapply(setNames(unique(names(CNA_borders)), unique(names(CNA_borders))),
+                      function(s){
+                        tmp = CNA_borders[names(CNA_borders)==as.character(s),]
+                        rbindlist(lapply(setNames(c("AMP", "DEL"), c("AMP", "DEL")),
+                                         function(a){
+                                           x = tmp[tmp$CNA==as.character(a),]
+                                           
+                                           overlaps = as.data.table(findOverlaps(x, cosmic_gr))
+                                           overlaps = with(overlaps, data.table(as.data.frame(mcols(x)[queryHits,]),
+                                                                                as.data.frame(cosmic[subjectHits,]),
+                                                                                distance = distance(resize(x[queryHits,], 1, fix="center"), cosmic_gr[subjectHits,])))
+                                           overlaps[, bin := cut(distance, breaks = seq(0, 1e5, 1e3), labels = 1:100, include.lowest = TRUE)]
+                                           overlaps = overlaps[FATHMM!="", .N, by=c("type", "CNA", "Primary_site", "FATHMM", "sample", "bin")]
+                                           return(overlaps)
+                                         }))
+                      }), idcol="Set")
+
+pl[, type := factor(type, levels=c("Primary", "Metastasis"))]
+
+ggplot(pl[Primary_site=="lung", .(N=sum(N)), by=c("Primary_site", "type", "CNA", "FATHMM", "bin")], aes(x=as.numeric(bin), y=N)) + geom_bar(stat="identity", position="identity") + facet_wrap(type~FATHMM+Primary_site, scales="free_y") + scale_x_continuous(name="Distance to CNA region boundary (kb)", breaks=c(1, seq(10, 100, 10)))
+
+pl2 = pl[, .(N = sum(N)), by=c("Set", "type", "CNA", "FATHMM", "sample", "bin")]
+pl2[, D := N/sum(N), by=c("Set", "type", "CNA", "FATHMM", "sample")]
+
+gg = ggplot(pl2[, .(D = mean(D)), by=c("Set", "type", "CNA", "FATHMM", "bin")], aes(x=as.numeric(bin), y=D, col=type, fill=type)) + geom_line(lwd=1) + geom_point(pch=21, col="grey75") + scale_colour_lancet(name="") + scale_fill_lancet(name="") + facet_grid(Set~CNA+FATHMM) + scale_x_continuous(name="Distance to CNA region boundary (kb)", breaks=c(1, seq(10, 100, 10))) + scale_y_continuous("Average SNV density") + theme_bw() + theme(legend.position = "top")
+ggsave(gg, filename = "COSMIC_SNVs_CNAs.png", units = "in", width = 12, height = 6, dpi = 300)
+```
+
+```{r gisticGenes}
+# gistic = fread("/home/agostif/Documents/GitHub/Lung_Cancer/extra/Table X.putative-drivers_chasm_deltalog_gistic.tsv")
+# gistic[gene=="AFDN", gene := "MLLT4"]
+# 
+# gistic_gr = with(gene.metadata[gene_name%in%gistic[, gene],][seqnames%in%chromosomes,], GRanges(seqnames, IRanges(start, end), strand, gene_name))
+# gistic_gr = sort.GenomicRanges(gistic_gr, ignore.strand=TRUE)
+
+gistic = list(Primary = fread(file.path("extra", "primary_all_lesions.conf_90.txt"))[`q values`<0.01,],
+              Metastasis = fread(file.path("extra", "metastasis_all_lesions.conf_90.txt"))[`q values`<0.01,])
+
+gistic = rbindlist(lapply(gistic,
+                function(x){
+                  tmp = x[, .(Type = gsub(" .*$", "", `Unique Name`), Peak = gsub("\\(.*$", "", `Peak Limits`))]
+                  tmp[, c("seqnames", "start", "end") := tstrsplit(gsub(":", "-", Peak), "-")]
+                  return(tmp)
+  }), idcol="Tumour") 
+
+gistic_gr = GRanges(gene.metadata[level<3,])[overlapsAny(GRanges(gene.metadata[level<3,]), with(gistic, GRanges(seqnames, IRanges(as.numeric(start), as.numeric(end)+1), CNA=Type))),]
+gistic_gr = gistic_gr[order(-width(gistic_gr)),]
+gistic_gr = sort.GenomicRanges(gistic_gr[!duplicated(gistic_gr$gene_name) & gistic_gr$gene_id%in%names(c(genes.pc.granges, genes.nc.granges)),], ignore.strand=TRUE)
+
+CNA_all$label = with(as.data.frame(CNA_all, row.names = NULL), ifelse(grepl("BM", sample), paste("BM", type, sep="_"), paste("FC", type, sep="_")))
+CNA_type = split(CNA_all, CNA_all$CNA)
+CNA_type = lapply(CNA_type, function(x) split(x, paste(gsub("_", "", x$sample), x$label, sep="_")))
+CNA_type = lapply(CNA_type, function(x) x[sapply(x, length)>2])
+
+# Same direction (AMP/AMP and AMP/DEL)
+mat1 = sapply(CNA_type[["AMP"]], function(x) overlapsAny(gistic_gr, x))
+mat2 = sapply(CNA_type[["DEL"]], function(x) overlapsAny(gistic_gr, x))
+
+combinations = combn(seq_len(length(gistic_gr)), 2, simplify=FALSE)
+
+res = matrix(NA, nrow = length(gistic_gr), ncol = length(gistic_gr))
+
+for( i in seq_along(combinations) ){
+  x = combinations[[i]]
+  cnt1 = sum(colSums(mat1[x,])==2)/ncol(mat1)
+  cnt2 = sum(colSums(mat2[x,])==2)/ncol(mat2)
+  res[x[1], x[2]] = cnt1
+  res[x[2], x[1]] = cnt2
+}
+
+res = as.data.frame(res, row.names = gistic_gr$gene_name)
+colnames(res) = gistic_gr$gene_name
+res = melt.data.table(data.table(res, keep.rownames = "Row"), id.vars = "Row", variable.name = "Col", value.name = "Value")
+res[, `:=`(Row = factor(Row, levels=gistic_gr$gene_name), Col = factor(Col, levels=gistic_gr$gene_name))]
+
+tab = data.table(as.data.frame(gistic_gr))[, .(I=.I, GRP=.GRP), by="seqnames"][, .(x1 = min(I)-0.5, y1 = min(I)-0.5, x2 = max(I)+0.5, y2 = max(I)+0.5), by="GRP"]
+# res[!is.na(Value) & Value != 0, Value := 1]
+
+gg = ggplot(res, aes(x=Row, y=Col, fill=Value)) +
+  geom_tile() + geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+  scale_fill_viridis(name="Occurrence", option = "plasma") +
+  labs(x="DEL/DEL", y="AMP/AMP") + coord_fixed() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+ggsave(gg, filename = "A549_CNAs_Gistic_combinations_all.png", units = "in", width = 16, height = 14, dpi = 300)
+
+pl = lapply(setNames(unique(CNA_all$label), unique(CNA_all$label)),
+            function(type){
+              
+              mat1 = sapply(CNA_type[["AMP"]][grepl(as.character(type), names(CNA_type[["AMP"]]))], function(x) overlapsAny(gistic_gr, x))
+              mat2 = sapply(CNA_type[["DEL"]][grepl(as.character(type), names(CNA_type[["DEL"]]))], function(x) overlapsAny(gistic_gr, x))
+              
+              combinations = combn(seq_len(length(gistic_gr)), 2, simplify=FALSE)
+              
+              res = matrix(NA, nrow = length(gistic_gr), ncol = length(gistic_gr))
+              
+              for( i in seq_along(combinations) ){
+                x = combinations[[i]]
+                cnt1 = sum(colSums(mat1[x,])==2)/ncol(mat1)
+                cnt2 = sum(colSums(mat2[x,])==2)/ncol(mat2)
+                res[x[1], x[2]] = cnt1
+                res[x[2], x[1]] = cnt2
+              }
+              
+              res = as.data.frame(res, row.names = gistic_gr$gene_name)
+              colnames(res) = gistic_gr$gene_name
+              res = melt.data.table(data.table(res, keep.rownames = "Row"), id.vars = "Row", variable.name = "Col", value.name = "Value")
+              res[, `:=`(Row = factor(Row, levels=gistic_gr$gene_name), Col = factor(Col, levels=gistic_gr$gene_name))]
+              
+              return(res)
+            })
+
+pl = rbindlist(pl, idcol="Type")
+pl[, Type := factor(Type, levels=unique(CNA_all$label))]
+
+gg = ggplot(pl, aes(x=Row, y=Col, fill=Value)) +
+  geom_tile() + geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+  scale_fill_viridis(name="Frequency", option = "plasma") +
+  facet_grid(~Type) + labs(x="DEL/DEL", y="AMP/AMP") + coord_fixed() +
+  theme_bw() + theme(legend.position = "bottom", legend.title = element_text(vjust=0.75), axis.text = element_blank(), axis.ticks = element_blank())
+ggsave(gg, filename = "A549_CNAs_Gistic_combinations_type.png", units = "in", width = 28, height = 12, dpi = 144)
+
+# Opposite direction (AMP/DEL and DEL/AMP)
+CNA_type = split(CNA_all[names(CNA_all)=="FullCohort",], CNA_all[names(CNA_all)=="FullCohort",]$CNA)
+unique_names = as.data.table(CNA_all[names(CNA_all)=="FullCohort",])[, .(sample=unique(sample)), by="type"][, .N, by="sample"][N==2, sample]
+CNA_type = lapply(CNA_type,
+                  function(x)
+                    split(x[x$sample%in%unique_names], paste(gsub("_", "", x[x$sample%in%unique_names]$sample), x[x$sample%in%unique_names]$type, sep="_")))
+unique_names = intersect(names(CNA_type[["AMP"]]), names(CNA_type[["DEL"]]))
+CNA_type = lapply(CNA_type, function(x) x[unique_names])
+
+mat1 = sapply(CNA_type[["AMP"]], function(x) overlapsAny(gistic_gr, x))
+mat2 = sapply(CNA_type[["DEL"]], function(x) overlapsAny(gistic_gr, x))
+
+combinations = combn(seq_len(length(gistic_gr)), 2, simplify=FALSE)
+
+res = matrix(NA, nrow = length(gistic_gr), ncol = length(gistic_gr))
+
+for( i in seq_along(combinations) ){
+  x = combinations[[i]]
+  cnt1 = sum(colSums(rbind(mat1[x[1],], mat2[x[2],]))==2)/ncol(mat1) # AMP/DEL
+  cnt2 = sum(colSums(rbind(mat2[x[1],], mat1[x[2],]))==2)/ncol(mat2) # DEL/AMP
+  res[x[1], x[2]] = cnt1
+  res[x[2], x[1]] = cnt2
+}
+
+res = as.data.frame(res, row.names = gistic_gr$gene_name)
+colnames(res) = gistic_gr$gene_name
+res = melt.data.table(data.table(res, keep.rownames = "Row"), id.vars = "Row", variable.name = "Col", value.name = "Value")
+res[, `:=`(Row = factor(Row, levels=gistic_gr$gene_name), Col = factor(Col, levels=gistic_gr$gene_name))]
+
+tab = data.table(as.data.frame(gistic_gr))[, .(I=.I, GRP=.GRP), by="seqnames"][, .(x1 = min(I)-0.5, y1 = min(I)-0.5, x2 = max(I)+0.5, y2 = max(I)+0.5), by="GRP"]
+# res[!is.na(Value) & Value != 0, Value := 1]
+
+gg = ggplot(res, aes(x=Row, y=Col, fill=Value)) +
+  geom_tile() + geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+  scale_fill_viridis(name="Occurrence", option = "plasma") +
+  labs(x="DEL/AMP", y="AMP/DEL") + coord_fixed() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+ggsave(gg, filename = "A549_CNAs_Gistic_combinations_all_opposite.png", units = "in", width = 16, height = 14, dpi = 300)
+
+pl = lapply(setNames(c("Primary", "Metastasis"), c("Primary", "Metastasis")),
+            function(type){
+              
+              mat1 = sapply(CNA_type[["AMP"]][grepl(as.character(type), names(CNA_type[["AMP"]]))], function(x) overlapsAny(gistic_gr, x))
+              mat2 = sapply(CNA_type[["DEL"]][grepl(as.character(type), names(CNA_type[["DEL"]]))], function(x) overlapsAny(gistic_gr, x))
+              
+              combinations = combn(seq_len(length(gistic_gr)), 2, simplify=FALSE)
+              
+              res = matrix(NA, nrow = length(gistic_gr), ncol = length(gistic_gr))
+              
+              for( i in seq_along(combinations) ){
+                x = combinations[[i]]
+                cnt1 = sum(colSums(rbind(mat1[x[1],], mat2[x[2],]))==2)/ncol(mat1) # AMP/DEL
+                cnt2 = sum(colSums(rbind(mat2[x[1],], mat1[x[2],]))==2)/ncol(mat2) # DEL/AMP
+                res[x[1], x[2]] = cnt1
+                res[x[2], x[1]] = cnt2
+              }
+              
+              res = as.data.frame(res, row.names = gistic_gr$gene_name)
+              colnames(res) = gistic_gr$gene_name
+              res = melt.data.table(data.table(res, keep.rownames = "Row"), id.vars = "Row", variable.name = "Col", value.name = "Value")
+              res[, `:=`(Row = factor(Row, levels=gistic_gr$gene_name), Col = factor(Col, levels=gistic_gr$gene_name))]
+              
+              return(res)
+            })
+
+pl = rbindlist(pl, idcol="Type")
+pl[, Type := factor(Type, levels=c("Primary", "Metastasis"))]
+
+gg = ggplot(pl, aes(x=Row, y=Col, fill=Value)) +
+  geom_tile() + geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+  scale_fill_viridis(name="Frequency", option = "plasma") +
+  facet_grid(~Type) + labs(x="DEL/AMP", y="AMP/DEL") + coord_fixed() +
+  theme_bw() + theme(legend.position = "bottom", legend.title = element_text(vjust=0.75), axis.text = element_blank(), axis.ticks = element_blank())
+ggsave(gg, filename = "A549_CNAs_Gistic_combinations_type_opposite.png", units = "in", width = 28, height = 16, dpi = 144)
+```
+
+```{r gisticGenesTADs}
+pl_gist = data.table(as.data.frame(gistic_gr))
+
+pl_tads = data.table(as.data.frame(tads))
+# pl_tads[, offset := ifelse(res=="tad100kb", 0, 0.1)]
+pl_tads[, height := sqrt(3)/2*(end-start)]
+
+CNA_FC_P = coverage(CNA_FC[CNA_FC$type=="Primary",])
+CNA_FC_M = coverage(CNA_FC[CNA_FC$type=="Metastasis",])
+
+pl_cnas = rbindlist(lapply(list(Primary=CNA_FC_P, Metastasis=CNA_FC_M),
+                           function(x)
+                             data.table(as.data.frame(GRanges(x)))[score>0, .(N=sum(score)), by=c("seqnames", "start", "end")]), idcol = "Type")
+
+pl_cnas[, N := log10(N)][, Type := factor(Type, levels=c("Primary", "Metastasis"))]
+pl_cnas[, Norm := N/sum(N*(end-start)/1e6), by="Type"]
+# pl_cnas[Type=="Primary", Norm := N/1362]
+# pl_cnas[!Type=="Primary", Norm := N/3728]
+
+max_y = pl_cnas[, max(N)]
+pl_tads[, range_x := diff(range(start, end)), by="seqnames"]
+pl_tads = pl_tads[, data.table(x = c(start, (start+end)/2, end), y = c(0.1, 0.1+height/range_x*max_y*2, 0.1), group=.GRP), by=c("seqnames", "start", "end", "res")]
+
+gg = ggplot() +
+  geom_rect(data=pl_gist, aes(xmin = start, xmax = end, ymin = 0, ymax = Inf), fill="forestgreen", alpha=0.5) +
+  geom_segment(data=pl_cnas, aes(x=start, xend=end, y=N, yend=N, col=Type)) +
+  geom_polygon(data=pl_tads, aes(x = x, y = y, group=group), fill="black", alpha=0.25) +
+  geom_rect(data=pl_tads, aes(xmin = start, xmax = end, ymin = 0, ymax = 0.1), fill="black", col=NA) +
+  scale_x_continuous("Genomic positon (bp)") + scale_y_continuous("CNA pile-up (coverage)") +
+  scale_colour_lancet() +
+  facet_wrap(~seqnames, ncol=2, scales="free_x", strip.position = "left") +
+  theme_bw() + theme(legend.position = "bottom")
+ggsave(gg, filename = "A549_TADs_CNAs_Gistic.png", units = "in", width = 24, height = 10, dpi = 144)
+
+gg = ggplot() +
+  geom_rect(data=pl_gist[seqnames=="chr14",], aes(xmin = start, xmax = end, ymin = 0, ymax = Inf), fill="forestgreen", alpha=0.5) +
+  geom_segment(data=pl_cnas[seqnames=="chr14",], aes(x=start, xend=end, y=N, yend=N, col=Type)) +
+  geom_polygon(data=pl_tads[seqnames=="chr14",], aes(x = x, y = y, group=group), fill="black", alpha=0.25) +
+  geom_rect(data=pl_tads[seqnames=="chr14",], aes(xmin = start, xmax = end, ymin = 0, ymax = 0.1), fill="black", col=NA) +
+  scale_x_continuous("Genomic positon (bp)") + scale_y_continuous("CNA pile-up (coverage)") +
+  scale_colour_lancet() +
+  facet_zoom(x=(start>6.6e7 & end<7e7)) +
+  geom_label_repel(data=pl_gist[seqnames=="chr14",], aes(x=(start+end)/2, label=gene_name), y=0.2, size=3) +
+  theme_bw() + theme(legend.position = "bottom")
+ggsave(gg, filename = "A549_TADs_CNAs_Gistic_chr14.png", units = "in", width = 14, height = 6, dpi = 300)
+```
+
+```{r genomeBins_10Mb}
+genomicBins = unlist(slidingWindows(GRanges(seqinfo(genes)), width = 1e7, step = 1e7), use.names = FALSE)
+
+CNA_all = unlist(GRangesList(CNAs))
+
+mat = sapply(split(CNA_all, CNA_all$sample), function(x) overlapsAny(genomicBins, x))
+combinations = combn(seq_len(length(genomicBins)), 2, simplify=FALSE)
+
+res = matrix(NA, nrow = length(genomicBins), ncol = length(genomicBins))
+
+for( i in seq_along(combinations) ){
+  x = combinations[[i]]
+  cnt = sum(colSums(mat[x,])==2)/ncol(mat)
+  res[x[1], x[2]] = cnt
+  res[x[2], x[1]] = cnt
+}
+
+bin_names = with(as.data.frame(genomicBins, row.names = NULL), paste(seqnames, start, sep="_"))
+res = as.data.frame(res, row.names = bin_names)
+colnames(res) = bin_names
+pl = melt.data.table(data.table(res, keep.rownames = "Row"), id.vars = "Row", variable.name = "Col", value.name = "Value")
+pl[, `:=`(Row = factor(Row, levels=bin_names), Col = factor(Col, levels=bin_names))]
+# pl[!is.na(Value) & Value != 0, Value := 1]
+
+tab = data.table(as.data.frame(genomicBins, row.names = NULL))[, .(I=.I, GRP=.GRP), by="seqnames"]
+tab = tab[, .(x1 = min(I)-0.5, y1 = min(I)-0.5, x2 = max(I)+0.5, y2 = max(I)+0.5), by="GRP"]
+
+gg = ggplot(pl, aes(x=Row, y=Col, fill=Value)) +
+  geom_tile(col="white") +
+  geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+  scale_fill_viridis(name="Occurrence", option = "plasma", guide=FALSE) +
+  labs(x="", y="") + coord_fixed() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+ggsave(gg, filename = "A549_genomicBins_combinations_CNA_all.png", units = "in", width = 12, height = 12, dpi = 300)
+
+pl = rbindlist(lapply(setNames(c("Primary", "Metastasis"), c("Primary", "Metastasis")),
+                      function(ty){
+                        tmp = CNA_all[CNA_all$type==as.character(ty),]
+                        mat = sapply(split(tmp, with(tmp, tmp$sample)), function(x) overlapsAny(genomicBins, x))
+                        combinations = combn(seq_len(length(genomicBins)), 2, simplify=FALSE)
+                        
+                        res = matrix(NA, nrow = length(genomicBins), ncol = length(genomicBins))
+                        
+                        for( i in seq_along(combinations) ){
+                          x = combinations[[i]]
+                          cnt = sum(colSums(mat[x,])==2)/ncol(mat)
+                          res[x[1], x[2]] = cnt
+                          res[x[2], x[1]] = cnt
+                        }
+                        
+                        bin_names = with(as.data.frame(genomicBins, row.names = NULL), paste(seqnames, start, sep="_"))
+                        res = as.data.frame(res, row.names = bin_names)
+                        colnames(res) = bin_names
+                        tmp = melt.data.table(data.table(res, keep.rownames = "Row"), id.vars = "Row", variable.name = "Col", value.name = "Value")
+                        tmp[, `:=`(Row = factor(Row, levels=bin_names), Col = factor(Col, levels=bin_names))]
+                        return(tmp)
+                      }), idcol="Type")
+
+tab = data.table(as.data.frame(genomicBins, row.names = NULL))[, .(I=.I, GRP=.GRP), by="seqnames"]
+tab = tab[, .(x1 = min(I)-0.5, y1 = min(I)-0.5, x2 = max(I)+0.5, y2 = max(I)+0.5), by="GRP"]
+
+pl[, Type := factor(Type, levels=c("Primary", "Metastasis"))]
+gg = ggplot(pl, aes(x=Row, y=Col, fill=Value)) +
+  geom_tile(col="white") +
+  geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+  scale_fill_viridis(name="Occurrence (%)", option = "plasma") +
+  labs(x="", y="") + facet_grid(~Type) + coord_fixed() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(), legend.position = "bottom", legend.title = element_text(vjust=0.8))
+ggsave(gg, filename = "A549_genomicBins_combinations_CNA_type.png", units = "in", width = 20, height = 12, dpi = 300)
+
+
+# pl = lapply(setNames(c("Primary", "Metastasis"), c("Primary", "Metastasis")),
+#             function(type){
+#               
+#               res = matrix(NA, nrow = length(gistic_gr), ncol = length(gistic_gr))
+#               tmp  = mat[, grepl(type, colnames(mat))]
+#               for( i in seq_along(combinations) ){
+#                 x = combinations[[i]]
+#                 cnt = sum(colSums(tmp[x,])==2)
+#                 res[x[1],x[2]] = cnt/ncol(tmp)
+#                 res[x[2],x[1]] = cnt/ncol(tmp)
+#               }
+#               
+#               res = as.data.frame(res, row.names = gistic_gr$gene_name)
+#               colnames(res) = gistic_gr$gene_name
+#               res = melt.data.table(data.table(res, keep.rownames = "Row"), id.vars = "Row", variable.name = "Col", value.name = "Value")
+#               res[, `:=`(Row = factor(Row, levels=gistic_gr$gene_name), Col = factor(Col, levels=gistic_gr$gene_name))]
+#               
+#               return(res)
+#             })
+# 
+# pl = rbindlist(pl, idcol="Type")
+# pl[, Type := factor(Type, levels=c("Primary", "Metastasis"))]
+# 
+# gg = ggplot(pl, aes(x=Row, y=Col, fill=Value)) +
+#   geom_tile(col="white") + geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+#   scale_fill_viridis(name="Frequency", option = "plasma") +
+#   facet_grid(~Type) + labs(x="", y="") + coord_fixed() +
+#   theme_bw() + theme(legend.position = "bottom", legend.title = element_text(vjust=0.75), axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+# ggsave(gg, filename = "A549_CNAs_Gistic_combinations_type.png", units = "in", width = 28, height = 16, dpi = 144)
+# 
+# setkeyv(pl, c("Row", "Col"))
+# pl = pl[Type=="Primary",][pl[Type=="Metastasis",], .(Row, Col, Diff = Value - i.Value)]
+# 
+# library(RColorBrewer)
+# 
+# gg = ggplot(pl, aes(x=Row, y=Col, fill=Diff)) +
+#   geom_tile(col="white") + geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+#   scale_fill_gradientn(name="Difference (Primary - Metastasis)", colours=c(rev(brewer.pal(5, "Blues")), brewer.pal(5, "Reds")), na.value="grey25", limits=c(-0.5, 0.5)) +
+#   labs(x="", y="") + coord_fixed() +
+#   theme_bw() + theme(legend.position = "bottom", legend.title = element_text(vjust=0.75), axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+# ggsave(gg, filename = "A549_CNAs_Gistic_combinations_diff.png", units = "in", width = 14, height = 14, dpi = 300)
+# 
+# 
+# 
+# 
+# 
+# pl_gist = data.table(as.data.frame(gistic_gr))
+# 
+# pl_tads = data.table(as.data.frame(tads))
+# # pl_tads[, offset := ifelse(res=="tad100kb", 0, 0.1)]
+# pl_tads[, height := sqrt(3)/2*(end-start)]
+# 
+# CNA_FC_P = coverage(CNA_FC[CNA_FC$type=="Primary",])
+# CNA_FC_M = coverage(CNA_FC[CNA_FC$type=="Metastasis",])
+# 
+# pl_cnas = rbindlist(lapply(list(Primary=CNA_FC_P, Metastasis=CNA_FC_M),
+#                            function(x)
+#                              data.table(as.data.frame(GRanges(x)))[score>0, .(N=sum(score)), by=c("seqnames", "start", "end")]), idcol = "Type")
+# 
+# pl_cnas[, N := log10(N)][, Type := factor(Type, levels=c("Primary", "Metastasis"))]
+# pl_cnas[, Norm := N/sum(N*(end-start)/1e6), by="Type"]
+# # pl_cnas[Type=="Primary", Norm := N/1362]
+# # pl_cnas[!Type=="Primary", Norm := N/3728]
+# 
+# max_y = pl_cnas[, max(N)]
+# pl_tads[, range_x := diff(range(start, end)), by="seqnames"]
+# pl_tads = pl_tads[, data.table(x = c(start, (start+end)/2, end), y = c(0.1, 0.1+height/range_x*max_y*2, 0.1), group=.GRP), by=c("seqnames", "start", "end", "res")]
+# 
+# gg = ggplot() +
+#   geom_rect(data=pl_gist, aes(xmin = start, xmax = end, ymin = 0, ymax = Inf), fill="forestgreen", alpha=0.5) +
+#   geom_segment(data=pl_cnas, aes(x=start, xend=end, y=N, yend=N, col=Type)) +
+#   geom_polygon(data=pl_tads, aes(x = x, y = y, group=group), fill="black", alpha=0.25) +
+#   geom_rect(data=pl_tads, aes(xmin = start, xmax = end, ymin = 0, ymax = 0.1), fill="black", col=NA) +
+#   scale_x_continuous("Genomic positon (bp)") + scale_y_continuous("CNA pile-up (coverage)") +
+#   scale_colour_lancet() +
+#   facet_wrap(~seqnames, ncol=2, scales="free_x", strip.position = "left") +
+#   theme_bw() + theme(legend.position = "bottom")
+# ggsave(gg, filename = "A549_TADs_CNAs_Gistic.png", units = "in", width = 24, height = 10, dpi = 144)
+# 
+# gg = ggplot() +
+#   geom_rect(data=pl_gist[seqnames=="chr14",], aes(xmin = start, xmax = end, ymin = 0, ymax = Inf), fill="forestgreen", alpha=0.5) +
+#   geom_segment(data=pl_cnas[seqnames=="chr14",], aes(x=start, xend=end, y=N, yend=N, col=Type)) +
+#   geom_polygon(data=pl_tads[seqnames=="chr14",], aes(x = x, y = y, group=group), fill="black", alpha=0.25) +
+#   geom_rect(data=pl_tads[seqnames=="chr14",], aes(xmin = start, xmax = end, ymin = 0, ymax = 0.1), fill="black", col=NA) +
+#   scale_x_continuous("Genomic positon (bp)") + scale_y_continuous("CNA pile-up (coverage)") +
+#   scale_colour_lancet() +
+#   facet_zoom(x=(start>6.6e7 & end<7e7)) +
+#   geom_label_repel(data=pl_gist[seqnames=="chr14",], aes(x=(start+end)/2, label=gene_name), y=0.2, size=3) +
+#   theme_bw() + theme(legend.position = "bottom")
+# ggsave(gg, filename = "A549_TADs_CNAs_Gistic_chr14.png", units = "in", width = 14, height = 6, dpi = 300)
+```
+
+```{r codingGenes}
+codingGenes = sort.GenomicRanges(with(gene.metadata[gene_type=="protein_coding",], GRanges(seqnames, IRanges(start, end), strand, gene_id, gene_name)), ignore.strand=TRUE)
+
+# CNA_all = unlist(GRangesList(CNAs))
+CNA_all = CNAs[[1]]
+
+mat = sapply(split(CNA_all, paste(CNA_all$type, CNA_all$sample, sep="_")), function(x) overlapsAny(codingGenes, x))
+
+# Select gene subgroup
+codingGenes = codingGenes[rowSums(mat)>20,]
+mat = mat[rowSums(mat)>20,]
+
+combinations = combn(seq_len(length(codingGenes)), 2, simplify=FALSE)
+
+res = matrix(NA, nrow = length(codingGenes), ncol = length(codingGenes))
+for( i in seq_along(combinations) ){
+  x = combinations[[i]]
+  dist = distance(codingGenes[x[1],], codingGenes[x[2],], ignore.strand=TRUE)
+  if( is.na(dist) | dist>1e7 ){
+    res[x[1], x[2]] = sum(colSums(mat[x,])==2)/ncol(mat)
+    res[x[2], x[1]] = cor(t(mat[x,]))[1,2]
+  }
+  if( i > 1 & i%%1e5==0 )
+    print(paste( i, "/", length(combinations)))
+}
+saveRDS(res, file = "PCgenes_ge20_topFreq_botCor.rds")
+
+res = as.data.frame(res, row.names = codingGenes$gene_name)
+colnames(res) = codingGenes$gene_name
+pl = melt.data.table(data.table(res, keep.rownames = "Row"), id.vars = "Row", variable.name = "Col", value.name = "Value")
+pl[, `:=`(Row = factor(Row, levels=unique(codingGenes$gene_name)), Col = factor(Col, levels=unique(codingGenes$gene_name)))]
+
+tab = data.table(as.data.frame(codingGenes, row.names = NULL))[, .(I=.I, GRP=.GRP), by="seqnames"]
+tab = tab[, .(x1 = min(I)-0.5, y1 = min(I)-0.5, x2 = max(I)+0.5, y2 = max(I)+0.5), by="GRP"]
+
+gg = ggplot(pl, aes(x=Row, y=Col, fill=Value)) +
+  geom_tile() +
+  geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+  scale_fill_viridis(name="Correlation/Frequency", option = "plasma", guide=FALSE) +
+  labs(x="Frequency", y="Correlation (Pearson)") + coord_fixed() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+ggsave(gg, filename = "A549_codingGenes_combinations_CNA_all.png", units = "in", width = 20, height = 20, dpi = 144)
+
+pl = rbindlist(lapply(setNames(c("Primary", "Metastasis"), c("Primary", "Metastasis")),
+                      function(ty){
+                        tmp = CNA_all[CNA_all$type==as.character(ty),]
+                        mat = sapply(split(tmp, with(tmp, tmp$sample)), function(x) overlapsAny(codingGenes, x))
+                        combinations = combn(seq_len(length(codingGenes)), 2, simplify=FALSE)
+                        
+                        res = matrix(NA, nrow = length(codingGenes), ncol = length(codingGenes))
+                        
+                        for( i in seq_along(combinations) ){
+                          x = combinations[[i]]
+                          cnt = sum(colSums(mat[x,])==2)/ncol(mat)
+                          res[x[1], x[2]] = cnt
+                          res[x[2], x[1]] = cnt
+                        }
+                        
+                        bin_names = with(as.data.frame(codingGenes, row.names = NULL), paste(seqnames, start, sep="_"))
+                        res = as.data.frame(res, row.names = bin_names)
+                        colnames(res) = bin_names
+                        tmp = melt.data.table(data.table(res, keep.rownames = "Row"), id.vars = "Row", variable.name = "Col", value.name = "Value")
+                        tmp[, `:=`(Row = factor(Row, levels=bin_names), Col = factor(Col, levels=bin_names))]
+                        return(tmp)
+                      }), idcol="Type")
+
+tab = data.table(as.data.frame(codingGenes, row.names = NULL))[, .(I=.I, GRP=.GRP), by="seqnames"]
+tab = tab[, .(x1 = min(I)-0.5, y1 = min(I)-0.5, x2 = max(I)+0.5, y2 = max(I)+0.5), by="GRP"]
+
+pl[, Type := factor(Type, levels=c("Primary", "Metastasis"))]
+gg = ggplot(pl, aes(x=Row, y=Col, fill=Value)) +
+  geom_tile(col="white") +
+  geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+  scale_fill_viridis(name="Occurrence (%)", option = "plasma") +
+  labs(x="", y="") + facet_grid(~Type) + coord_fixed() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(), legend.position = "bottom", legend.title = element_text(vjust=0.8))
+ggsave(gg, filename = "A549_genomicBins_combinations_CNA_type.png", units = "in", width = 20, height = 12, dpi = 300)
+
+
+# pl = lapply(setNames(c("Primary", "Metastasis"), c("Primary", "Metastasis")),
+#             function(type){
+#               
+#               res = matrix(NA, nrow = length(gistic_gr), ncol = length(gistic_gr))
+#               tmp  = mat[, grepl(type, colnames(mat))]
+#               for( i in seq_along(combinations) ){
+#                 x = combinations[[i]]
+#                 cnt = sum(colSums(tmp[x,])==2)
+#                 res[x[1],x[2]] = cnt/ncol(tmp)
+#                 res[x[2],x[1]] = cnt/ncol(tmp)
+#               }
+#               
+#               res = as.data.frame(res, row.names = gistic_gr$gene_name)
+#               colnames(res) = gistic_gr$gene_name
+#               res = melt.data.table(data.table(res, keep.rownames = "Row"), id.vars = "Row", variable.name = "Col", value.name = "Value")
+#               res[, `:=`(Row = factor(Row, levels=gistic_gr$gene_name), Col = factor(Col, levels=gistic_gr$gene_name))]
+#               
+#               return(res)
+#             })
+# 
+# pl = rbindlist(pl, idcol="Type")
+# pl[, Type := factor(Type, levels=c("Primary", "Metastasis"))]
+# 
+# gg = ggplot(pl, aes(x=Row, y=Col, fill=Value)) +
+#   geom_tile(col="white") + geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+#   scale_fill_viridis(name="Frequency", option = "plasma") +
+#   facet_grid(~Type) + labs(x="", y="") + coord_fixed() +
+#   theme_bw() + theme(legend.position = "bottom", legend.title = element_text(vjust=0.75), axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+# ggsave(gg, filename = "A549_CNAs_Gistic_combinations_type.png", units = "in", width = 28, height = 16, dpi = 144)
+# 
+# setkeyv(pl, c("Row", "Col"))
+# pl = pl[Type=="Primary",][pl[Type=="Metastasis",], .(Row, Col, Diff = Value - i.Value)]
+# 
+# library(RColorBrewer)
+# 
+# gg = ggplot(pl, aes(x=Row, y=Col, fill=Diff)) +
+#   geom_tile(col="white") + geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+#   scale_fill_gradientn(name="Difference (Primary - Metastasis)", colours=c(rev(brewer.pal(5, "Blues")), brewer.pal(5, "Reds")), na.value="grey25", limits=c(-0.5, 0.5)) +
+#   labs(x="", y="") + coord_fixed() +
+#   theme_bw() + theme(legend.position = "bottom", legend.title = element_text(vjust=0.75), axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+# ggsave(gg, filename = "A549_CNAs_Gistic_combinations_diff.png", units = "in", width = 14, height = 14, dpi = 300)
+```
+
+```{r cosmicSNVs}
+CNA_all = keepSeqlevels(unlist(GRangesList(CNAs)), chromosomes, pruning.mode = "coarse")
+SNV_all = cosmic[chrom%in%chromosomes & Type%in%c("primary", "metastasis") & FATHMM=="PATHOGENIC",
+                 split(GRanges(chrom, IRanges(start, width=1), Type=Type), Primary_site)]
+SNV_all = SNV_all[sapply(SNV_all, length)>1e3]
+
+# gistic = fread("/home/agostif/Documents/GitHub/Lung_Cancer/extra/gistic_all-significant-genes.tsv")
+# gistic[gene=="AFDN", gene := "MLLT4"]
+# 
+# gistic_gr = with(gene.metadata[order(-width),][!duplicated(gene_name),][gene_name%in%gistic[qvalue<0.001, gene] & gene_type=="protein_coding",],
+#                  GRanges(seqnames, IRanges(start, end), gene_type=gene_type, gene_name=gene_name))
+# gistic_gr = sort.GenomicRanges(gistic_gr, ignore.strand=TRUE)
+
+gistic = fread("/home/agostif/Documents/GitHub/Lung_Cancer/extra/Table X.putative-drivers_chasm_deltalog_gistic.tsv")
+gistic[gene=="AFDN", gene := "MLLT4"]
+
+gistic_gr = with(gene.metadata[gene_name%in%gistic[, gene],][seqnames%in%chromosomes,], GRanges(seqnames, IRanges(start, end), strand, gene_name))
+gistic_gr = sort.GenomicRanges(gistic_gr, ignore.strand=TRUE)
+
+# mat1 = sapply(split(CNA_all, CNA_all$sample), function(x) overlapsAny(gistic_gr, x))
+# mat2 = sapply(SNV_all, function(x) overlapsAny(gistic_gr, x))
+# 
+# combinations = combn(seq_len(length(gistic_gr)), 2, simplify=FALSE)
+# 
+# res = matrix(NA, nrow = length(gistic_gr), ncol = length(gistic_gr))
+# 
+# for( i in seq_along(combinations) ){
+#   x = combinations[[i]]
+#   cnt1 = sum(colSums(mat1[x,])==2)/ncol(mat1)
+#   cnt2 = sum(colSums(mat2[x,])==2)/ncol(mat2)
+#   res[x[1], x[2]] = cnt1
+#   res[x[2], x[1]] = cnt2
+# }
+# 
+# res = as.data.frame(res, row.names = gistic_gr$gene_name)
+# colnames(res) = gistic_gr$gene_name
+# pl = melt.data.table(data.table(res, keep.rownames = "Row"), id.vars = "Row", variable.name = "Col", value.name = "Value")
+# pl[, `:=`(Row = factor(Row, levels=gistic_gr$gene_name), Col = factor(Col, levels=gistic_gr$gene_name))]
+# # pl[!is.na(Value) & Value != 0, Value := 1]
+# 
+# tab = data.table(as.data.frame(gistic_gr, row.names = NULL))[, .(I=.I, GRP=.GRP), by="seqnames"]
+# tab = tab[, .(x1 = min(I)-0.5, y1 = min(I)-0.5, x2 = max(I)+0.5, y2 = max(I)+0.5), by="GRP"]
+# 
+# gg = ggplot(pl, aes(x=Row, y=Col, fill=Value)) +
+#   geom_tile(col="white") +
+#   geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+#   scale_fill_viridis(name="Occurrence", option = "plasma") +
+#   labs(x="SNVs", y="CNAs") + coord_fixed() + theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+# ggsave(gg, filename = "COSMIC_SNVs_CNAs_cooccurrence.png", units = "in", width = 12, height = 12, dpi = 300)
+# 
+# pl = rbindlist(lapply(setNames(c("primary", "metastasis"), c("Primary", "Metastasis")),
+#                       function(ty){
+#                         tmp1 = CNA_all[tolower(CNA_all$type)==as.character(ty),]
+# 
+#                         mat1 = sapply(split(tmp1, with(tmp1, tmp1$sample)), function(x) overlapsAny(gistic_gr, x))
+#                         mat2 = sapply(lapply(SNV_all, function(y) y[tolower(y$Type)==as.character(ty),]), function(x) overlapsAny(gistic_gr, x))
+#                         
+#                         combinations = combn(seq_len(length(gistic_gr)), 2, simplify=FALSE)
+#                         
+#                         res = matrix(NA, nrow = length(gistic_gr), ncol = length(gistic_gr))
+#                         
+#                         for( i in seq_along(combinations) ){
+#                           x = combinations[[i]]
+#                           cnt1 = sum(colSums(mat1[x,])==2)/ncol(mat1)
+#                           cnt2 = sum(colSums(mat2[x,])==2)/ncol(mat2)
+#                           res[x[1], x[2]] = cnt1
+#                           res[x[2], x[1]] = cnt2
+#                         }
+#                         
+#                         res = as.data.frame(res, row.names = gistic_gr$gene_name)
+#                         colnames(res) = gistic_gr$gene_name
+#                         tmp = melt.data.table(data.table(res, keep.rownames = "Row"), id.vars = "Row", variable.name = "Col", value.name = "Value")
+#                         tmp[, `:=`(Row = factor(Row, levels=gistic_gr$gene_name), Col = factor(Col, levels=gistic_gr$gene_name))]
+#                         return(tmp)
+#                       }), idcol="Type")
+# 
+# tab = data.table(as.data.frame(gistic_gr, row.names = NULL))[, .(I=.I, GRP=.GRP), by="seqnames"]
+# tab = tab[, .(x1 = min(I)-0.5, y1 = min(I)-0.5, x2 = max(I)+0.5, y2 = max(I)+0.5), by="GRP"]
+# 
+# pl[, Type := factor(Type, levels=c("Primary", "Metastasis"))]
+# gg = ggplot(pl, aes(x=Row, y=Col, fill=Value)) +
+#   geom_tile(col="white") +
+#   geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+#   scale_fill_viridis(name="Occurrence", option = "plasma") +
+#   labs(x="", y="") + facet_grid(~Type) + coord_fixed() +
+#   theme(axis.text = element_blank(), axis.ticks = element_blank(), legend.position = "bottom", legend.title = element_text(vjust=0.8))
+# ggsave(gg, filename = "COSMIC_SNVs_CNAs_cooccurrence_type.png", units = "in", width = 20, height = 12, dpi = 300)
+
+
+SNV_lung = fread("/home/agostif/Projects/GPSeq_analysis/FA/CosmicMutantExport-hg19.tsv.gz")[`Primary site`=="lung"]
+SNV_lung = SNV_lung[, .(Sample = `Sample name`, Primary = `Primary site`, WholeGenome = `Genome-wide screen`,
+                        Mutation = `Mutation Description`, Position = `Mutation genome position`,
+                        FATHMM = `FATHMM prediction`, Status = `Mutation somatic status`, Type = `Tumour origin`)]
+SNV_lung[, c("chrom", "start", "end") := tstrsplit(gsub(":", "-", Position), "-")]
+SNV_lung[, `:=`(chrom = paste0("chr", chrom), start = as.numeric(start), end = as.numeric(end))]
+SNV_lung[, N := .N, by="Sample"]
+
+SNV_lung_gr = SNV_lung[N>1000 & chrom%in%chromosomes & Type%in%c("primary", "metastasis") & FATHMM=="PATHOGENIC",
+                    split(GRanges(chrom, IRanges(start, width=1), Type=Type), Sample)]
+SNV_lung_gr = SNV_lung_gr[sapply(SNV_lung_gr, length)>=1000,]
+
+mat1 = sapply(split(CNA_all, CNA_all$sample), function(x) overlapsAny(gistic_gr, x))
+mat2 = sapply(SNV_lung_gr, function(x) overlapsAny(gistic_gr, x))
+
+combinations = combn(seq_len(length(gistic_gr)), 2, simplify=FALSE)
+
+res = matrix(NA, nrow = length(gistic_gr), ncol = length(gistic_gr))
+
+for( i in seq_along(combinations) ){
+  x = combinations[[i]]
+  cnt1 = sum(colSums(mat1[x,])==2)/ncol(mat1)
+  cnt2 = sum(colSums(mat2[x,])==2)/ncol(mat2)
+  res[x[1], x[2]] = cnt1
+  res[x[2], x[1]] = cnt2
+}
+
+res = as.data.frame(res, row.names = gistic_gr$gene_name)
+colnames(res) = gistic_gr$gene_name
+pl = melt.data.table(data.table(res, keep.rownames = "Row"), id.vars = "Row", variable.name = "Col", value.name = "Value")
+pl[, `:=`(Row = factor(Row, levels=gistic_gr$gene_name), Col = factor(Col, levels=gistic_gr$gene_name))]
+# pl[!is.na(Value) & Value != 0, Value := 1]
+
+tab = data.table(as.data.frame(gistic_gr, row.names = NULL))[, .(I=.I, GRP=.GRP), by="seqnames"]
+tab = tab[, .(x1 = min(I)-0.5, y1 = min(I)-0.5, x2 = max(I)+0.5, y2 = max(I)+0.5), by="GRP"]
+
+# gg = ggplot(pl, aes(x=Row, y=Col, fill=Value)) +
+#   geom_tile(col="white") +
+#   geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+#   scale_fill_viridis(name="Occurrence", option = "plasma") +
+#   labs(x="COSMIC SNVs (lung)", y="CNAs") + coord_fixed() + theme(axis.text = element_blank())
+# ggsave(gg, filename = "COSMIC_SNVs_CNAs_cooccurrence_test.png", units = "in", width = 20, height = 20, dpi = 300)
+
+gg = ggplot(pl, aes(x=Row, y=Col, fill=Value)) +
+  geom_tile(col="white") +
+  geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+  scale_fill_viridis(name="Occurrence", option = "plasma") +
+  labs(x="COSMIC SNVs (lung)", y="CNAs") + coord_fixed() + theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5))
+ggsave(gg, filename = "COSMIC_SNVs_CNAs_cooccurrence.png", units = "in", width = 12, height = 12, dpi = 300)
+
+pl = rbindlist(lapply(setNames(c("primary", "metastasis"), c("Primary", "Metastasis")),
+                      function(ty){
+                        tmp1 = CNA_all[tolower(CNA_all$type)==as.character(ty),]
+
+                        mat1 = sapply(split(tmp1, with(tmp1, tmp1$sample)), function(x) overlapsAny(gistic_gr, x))
+                        mat2 = sapply(lapply(SNV_lung_gr, function(y) y[tolower(y$Type)==as.character(ty),]), function(x) overlapsAny(gistic_gr, x))
+                        
+                        combinations = combn(seq_len(length(gistic_gr)), 2, simplify=FALSE)
+                        
+                        res = matrix(NA, nrow = length(gistic_gr), ncol = length(gistic_gr))
+                        
+                        for( i in seq_along(combinations) ){
+                          x = combinations[[i]]
+                          cnt1 = sum(colSums(mat1[x,])==2)/ncol(mat1)
+                          cnt2 = sum(colSums(mat2[x,])==2)/ncol(mat2)
+                          res[x[1], x[2]] = cnt1
+                          res[x[2], x[1]] = cnt2
+                        }
+                        
+                        res = as.data.frame(res, row.names = gistic_gr$gene_name)
+                        colnames(res) = gistic_gr$gene_name
+                        tmp = melt.data.table(data.table(res, keep.rownames = "Row"), id.vars = "Row", variable.name = "Col", value.name = "Value")
+                        tmp[, `:=`(Row = factor(Row, levels=gistic_gr$gene_name), Col = factor(Col, levels=gistic_gr$gene_name))]
+                        return(tmp)
+                      }), idcol="Type")
+
+tab = data.table(as.data.frame(gistic_gr, row.names = NULL))[, .(I=.I, GRP=.GRP), by="seqnames"]
+tab = tab[, .(x1 = min(I)-0.5, y1 = min(I)-0.5, x2 = max(I)+0.5, y2 = max(I)+0.5), by="GRP"]
+
+pl[, Type := factor(Type, levels=c("Primary", "Metastasis"))]
+gg = ggplot(pl, aes(x=Row, y=Col, fill=Value)) +
+  geom_tile(col="white") +
+  geom_rect(data=tab, aes(xmin=x1, ymin=y1, xmax=x2, ymax=y2), fill=NA, col="black", inherit.aes = FALSE) +
+  scale_fill_viridis(name="Occurrence", option = "plasma") +
+  labs(x="COSMIC SNVs (lung)", y="CNAs") + facet_grid(~Type) + coord_fixed() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.5), legend.position = "bottom", legend.title = element_text(vjust=0.8))
+ggsave(gg, filename = "COSMIC_SNVs_CNAs_cooccurrence_type.png", units = "in", width = 20, height = 12, dpi = 300)
+```
+
+```{r chipseq, eval=FALSE}
+chip_files = list.files(file.path(chip.folder, "results", "macs"), pattern="summits.bed$", full.names = TRUE)
+names(chip_files) = as.data.table(tstrsplit(basename(chip_files), "_")[5:6])[, paste(V1, V2, sep="_")]
+chip_peaks = GRangesList(lapply(chip_files, import.bed))
+seqlevelsStyle(chip_peaks) <- "UCSC"
+chip_peaks = lapply(chip_peaks, function(x) keepSeqlevels(x, chromosomes, pruning.mode = "coarse"))
+chip_peaks = chip_peaks[sapply(chip_peaks, length)>=1000] # Select only experiments with more than 1000 peaks
+
+CNA_FC_PRI = coverage(CNA_FC[CNA_FC$type=="Primary",])
+CNA_FC_MET = coverage(CNA_FC[CNA_FC$type=="Metastasis",])
+# CNA_BM_AMP = coverage(CNA_BM[CNA_BM$type=="AMP",])
+# CNA_BM_DEL = coverage(CNA_BM[CNA_BM$type=="DEL",])
+
+# CNAs = list(CNA_FC_AMP=GRanges(CNA_FC_AMP), CNA_FC_DEL=GRanges(CNA_FC_DEL), CNA_BM_AMP=GRanges(CNA_BM_AMP), CNA_BM_DEL=GRanges(CNA_BM_DEL))
+CNAs = list(CNA_FC_PRI=GRanges(CNA_FC_PRI), CNA_FC_MET=GRanges(CNA_FC_MET))
+
+set.seed(42)
+pl = rbindlist(lapply(chip_peaks,
+                      function(x)
+                        rbindlist(lapply(CNAs,
+                                         function(y)
+                                           rbindlist(lapply(1:100,
+                                                            function(i){
+                                                              tmp = sample(y, 1000, replace = FALSE)
+                                                              tmp = as.data.table(distanceToNearest(c(resize(tmp, 1, fix="start"), resize(tmp, 1, fix="end")),
+                                                                                                    sample(x, 1000, replace = FALSE)))
+                                                              tmp[, .(Mean=mean(distance), SD=sd(distance))]
+                                                            }))),
+                                  idcol="CNAset")),
+               idcol="ChIPset")
+pl[, c("Target", "Replicate") := tstrsplit(ChIPset, "_")]
+
+ggplot(pl[distance<=1e6,], aes(x=log10(distance+1), group=CNAset, col=Replicate)) + geom_density() + facet_wrap(~Target)
+ggplot(pl[distance<=1e6,], aes(x=log10(distance+1), group=paste(CNAset, Replicate), col=Replicate)) + geom_density() + facet_wrap(~Target)
+
+pl[grepl("H3K", Target), Set := "HistoneMark"][is.na(Set), Set := "OtherProtein"]
+
+gg = ggplot(pl, aes(x=ChIPset, y=distance+1, fill=CNAset)) +
+  ggtitle("CNA distance to nearest ChIP-seq peak") +
+  geom_boxplot() +
+  scale_x_discrete("ChIP-seq dataset") + scale_y_log10("Genomic distance (bp)") +
+  scale_fill_manual(values = tableau_color_pal(palette="Classic Blue-Red 12")(4)[c(1,3,2,4)]) +
+  facet_wrap(~Set, scales="free_y") + coord_flip() +
+  theme_bw() + theme(legend.position="bottom") + guides(fill=guide_legend(title = "CNA dataset and type"))
+ggsave(gg, filename = "A549_ChIPseqPeaks_CNAs.png", units = "in", width = 14, height = 8, dpi = 300)
+```
+
+```{r test, eval=FALSE}
+gistic = list(Primary = fread(file.path("extra", "primary_all_lesions.conf_90.txt"))[`q values`<0.1,],
+              Metastasis = fread(file.path("extra", "metastasis_all_lesions.conf_90.txt"))[`q values`<0.1,])
+
+gistic = lapply(gistic,
+                function(x){
+                  tmp = x[, .(Type = gsub(" .*$", "", `Unique Name`), Region = gsub("\\(.*$", "", `Region Limits`))]
+                  tmp[, c("seqnames", "start", "end") := tstrsplit(gsub(":", "-", Region), "-")]
+                  return(tmp)
+  })
+
+pl = rbindlist(gistic, idcol="Set")
+pl = list(resize(with(pl, GRanges(seqnames, IRanges(as.numeric(start), as.numeric(end)), Set=Set, Type=Type)), 1, fix="start"),
+          resize(with(pl, GRanges(seqnames, IRanges(as.numeric(start), as.numeric(end)), Set=Set, Type=Type)), 1, fix="end"))
+pl = lapply(pl, function(x) data.table(as.data.frame(x), as.data.table(distanceToNearest(x, c(resize(tads, 1, fix="start"), resize(tads, 1, fix="end"))))$distance))
+
+ggplot(rbindlist(pl), aes(x=V2+1, fill=paste(Set, Type))) + geom_density(alpha=0.5) + scale_x_log10()
+```
+
+```{r enhancers}
+# EN = fread(file.path("/home/agostif/Documents/GitHub/Lung_Cancer/extra/EnhancerAtlas2_A549_E.bed"))
+# EN = with(EN, GRanges(V1, IRanges(V2, V3)))
+# 
+# pl = lapply(split(CNAs[[1]], CNAs[[1]]$type),
+#             function(x)
+#               distanceToReference(c(resize(x, 1, fix="start"), resize(x, 1, fix="end")), EN, width=1000, fix="start", normType="none"))
+# pl = rbindlist(pl, idcol="Type")
+# ggplot(pl, aes(x=distance, y=Count, col=Type)) + geom_line()
+# 
+# ES = fread(file.path("/home/agostif/Documents/GitHub/Lung_Cancer/extra/EnhancerAtlas2_A549_ESNP.bed"))
+# 
+# EP = fread("/home/agostif/Documents/GitHub/Lung_Cancer/extra/EnhancerAtlas2_A549_EP.txt")
+
+# fantom = list(Robust = fread(file.path("/home/agostif/Documents/GitHub/Lung_Cancer/extra/robust_enhancers.bed"), skip=1),
+#               Permissive = fread(file.path("/home/agostif/Documents/GitHub/Lung_Cancer/extra/permissive_enhancers.bed"), skip=1),
+#               Lung_specific = fread(file.path("/home/agostif/Documents/GitHub/Lung_Cancer/extra/UBERON 0002048_lung_differentially_expressed_enhancers.bed"), skip=1))
+# 
+# pl = rbindlist(lapply(split(CNAs[[1]], CNAs[[1]]$type),
+#             function(x)
+#               rbindlist(lapply(fantom, 
+#                      function(y)
+#                        data.table(as.data.frame(mcols(c(x, x))),
+#                                   distance=as.data.table(distanceToNearest(c(resize(x, 1, fix="start"), resize(x, 1, fix="end")),
+#                                                                            with(y, GRanges(V1, IRanges(V2, V3)))))$distance+1)), idcol="Enhancer")))
+# 
+# pl[, `:=`(type = factor(type, levels=c("Primary", "Metastasis")), Enhancer = factor(Enhancer, levels=c("Permissive", "Robust", "Lung_specific")))]
+# 
+# tab = as.data.table(sapply(fantom, nrow), keep.rownames = TRUE)
+# setnames(tab, "V1", "Enhancer")
+# tab[, Enhancer := factor(Enhancer, levels=c("Robust", "Permissive", "Lung_specific"))]
+# 
+# gg = ggplot(pl, aes(x=type, y=distance/1e3)) +
+#   ggtitle("FANTOM5 Enhancers") +
+#   geom_violin(aes(fill=type), alpha=0.75, trim = TRUE) +
+#   geom_boxplot(fill="white", width=0.2, outlier.colour = NA) +
+#   scale_y_log10() + 
+#   scale_fill_lancet() +
+#   facet_wrap(~Enhancer) +
+#   geom_text(data=tab, aes(label=V2), x=1.5, y=-Inf, vjust=-1) +
+#   stat_compare_means(comparisons = list(levels(pl[, type]))) +
+#   guides(fill=FALSE) + labs(x="Sample type", y="CNA distance to nearest enhancer (kb)") + theme_bw()
+# ggsave(gg, filename = "FANTOM5_Enhancers_CNAs.png", units = "in", width = 10, height = 6, dpi = 300)
+
+CNA_split = split(CNAs[[1]], CNAs[[1]]$type)
+CNA_split = c(CNA_split, CNAs[2])
+CNA_split = lapply(CNA_split, function(x) c(resize(x, 1, fix="start"), resize(x, 1, fix="end")))
+
+RNAseq = lapply(list.files("extra", pattern="RNAseq"), function(x) fread(file.path("extra", x), skip=1, select = c(1, 6:7), col.names = c("gene_id", "Length", "Count")))
+names(RNAseq) = paste0("Rep", seq_along(RNAseq))
+RNAseq = rbindlist(lapply(RNAseq, function(x) data.table(x, TPM = countToTPM(x$Count, with(x, GRanges(1, IRanges(start=1, width=Length)))))), idcol="Rep")
+RNAseq = RNAseq[, .(TPM = mean(TPM)), by="gene_id"]
+setkey(RNAseq, gene_id)
+setkey(gene.metadata, gene_id)
+RNAseq[gene.metadata, gene_name := gene_name]
+setkey(RNAseq, gene_name)
+RNAseq = RNAseq[, .(TPM = sum(TPM, na.rm = TRUE)), by="gene_name"]
+
+enhancerAtlas = fread("/home/agostif/Documents/GitHub/Lung_Cancer/extra/EnhancerAtlas2_A549_EP.txt")
+enhancerAtlas[, c("gChr", "gStart", "gEnd") := tstrsplit(gsub(":", "-", gsub("_.*$", "", V1)), "-")]
+enhancerAtlas[, `:=`(gStart = as.numeric(gStart), gEnd = as.numeric(gEnd))]
+setkey(enhancerAtlas, V2)
+enhancerAtlas[RNAseq, TPM := TPM]
+EPchord = with(enhancerAtlas[V3==gChr & V3%in%chromosomes & TPM>=1,], GRanges(gChr, IRanges(ifelse(gStart>V4, V4, gStart), ifelse(gStart>V4, gStart, V4)), name=V2, TPM=TPM))
+
+pl = rbindlist(lapply(CNA_split, function(x){
+  count = rowSums(sapply(split(x, x$sample), function(y) overlapsAny(EPchord, y)))
+  data.table(as.data.frame(EPchord), frac = count/length(split(x, x$sample)))
+  }), idcol="Dataset")
+pl = dcast.data.table(pl, seqnames+start+end+name~Dataset, value.var = "frac", fill=0)
+
+pl = pl[BM>=0.1 | Metastasis>=0.1 | Primary>=0.1,]
+# pl[, name := gsub("\\.*.$", "", name)]
+pl = pl[order(name, -(BM+Metastasis+Primary))][!duplicated(name) & !name=="",]
+pl = melt.data.table(pl, id.vars = "name", measure.vars = names(CNA_split))
+pl[, variable := factor(variable, levels=c("Primary", "Metastasis", "BM"))]
+
+gg = ggplot(pl, aes(x=name, y=value, fill=variable)) + ggtitle("Enhancer-Promoter region encompassing at least one CNA boundary", subtitle = "Threshold: at least one set with frequncy >= 10%; Gene expression (TPM) >= 1") + geom_bar(stat="identity", position = "dodge", col="black") + scale_fill_lancet(name="Dataset", alpha=0.75) + scale_x_discrete("Enhancer-regulated gene") + scale_y_continuous("CNA frequency across samples", labels = percent) + theme_pubr() + theme(axis.text.x = element_text(angle=45, hjust=1))
+ggsave(gg, filename = "EnhancerAtlas_CNAs_disrupting_EP.png", units = "in", width = 12, height = 6, dpi = 300)
+
+pl = rbindlist(lapply(CNA_split, function(x){
+  count = rowSums(sapply(split(x[x$CNA=="AMP",], x[x$CNA=="AMP",]$sample), function(y) overlapsAny(EPchord, y)))
+  data.table(as.data.frame(EPchord), frac = count/length(split(x[x$CNA=="AMP",], x[x$CNA=="AMP",]$sample)))
+  }), idcol="Dataset")
+pl = dcast.data.table(pl, seqnames+start+end+name~Dataset, value.var = "frac", fill=0)
+
+pl = pl[BM>=0.1 | Metastasis>=0.1 | Primary>=0.1,]
+# pl[, name := gsub("\\.*.$", "", name)]
+pl = pl[order(name, -(BM+Metastasis+Primary))][!duplicated(name) & !name=="",]
+pl = melt.data.table(pl, id.vars = "name", measure.vars = names(CNA_split))
+pl[, variable := factor(variable, levels=c("Primary", "Metastasis", "BM"))]
+
+gg = ggplot(pl, aes(x=name, y=value, fill=variable)) + ggtitle("Enhancer-Promoter region encompassing at least one amplification boundary", subtitle = "Threshold: at least one set with frequncy >= 10%; Gene expression (TPM) >= 1") + geom_bar(stat="identity", position = "dodge", col="black") + scale_fill_lancet(name="Dataset", alpha=0.75) + scale_x_discrete("Enhancer-regulated gene") + scale_y_continuous("CNA frequency across samples", labels = percent) + theme_pubr() + theme(axis.text.x = element_text(angle=45, hjust=1))
+ggsave(gg, filename = "EnhancerAtlas_CNAs_disrupting_EP_AMP.png", units = "in", width = 12, height = 6, dpi = 300)
+
+pl = rbindlist(lapply(CNA_split, function(x){
+  count = rowSums(sapply(split(x[x$CNA=="DEL",], x[x$CNA=="DEL",]$sample), function(y) overlapsAny(EPchord, y)))
+  data.table(as.data.frame(EPchord), frac = count/length(split(x[x$CNA=="DEL",], x[x$CNA=="DEL",]$sample)))
+  }), idcol="Dataset")
+pl = dcast.data.table(pl, seqnames+start+end+name~Dataset, value.var = "frac", fill=0)
+
+pl = pl[BM>=0.05 | Metastasis>=0.05 | Primary>=0.05,]
+# pl[, name := gsub("\\.*.$", "", name)]
+pl = pl[order(name, -(BM+Metastasis+Primary))][!duplicated(name) & !name=="",]
+pl = melt.data.table(pl, id.vars = "name", measure.vars = names(CNA_split))
+pl[, variable := factor(variable, levels=c("Primary", "Metastasis", "BM"))]
+
+gg = ggplot(pl, aes(x=name, y=value, fill=variable)) + ggtitle("Enhancer-Promoter region encompassing at least one deletion boundary", subtitle = "Threshold: at least one set with frequncy >= 5%; Gene expression (TPM) >= 1") + geom_bar(stat="identity", position = "dodge", col="black") + scale_fill_lancet(name="Dataset", alpha=0.75) + scale_x_discrete("Enhancer-regulated gene") + scale_y_continuous("CNA frequency across samples", labels = percent) + theme_pubr() + theme(axis.text.x = element_text(angle=45, hjust=1))
+ggsave(gg, filename = "EnhancerAtlas_CNAs_disrupting_EP_DEL.png", units = "in", width = 12, height = 6, dpi = 300)
+
+
+PA_upreg = fread("/home/agostif/Documents/GitHub/Lung_Cancer/extra/ProteinAtlas_cancer_category_rna_lung.tsv", skip=1, select=1)
+
+pl = rbindlist(lapply(CNA_split, function(x){
+  count = rowSums(sapply(split(x, x$sample), function(y) overlapsAny(EPchord[EPchord$name%in%PA_upreg[, V1],], y)))
+  data.table(as.data.frame(EPchord[EPchord$name%in%PA_upreg[, V1],]), frac = count/length(split(x, x$sample)))
+  }), idcol="Dataset")
+pl = dcast.data.table(pl, seqnames+start+end+name~Dataset, value.var = "frac", fill=0)
+
+pl[, name := gsub("\\.*.$", "", name)]
+pl = pl[order(name, -(BM+Metastasis+Primary))][!duplicated(name) & !name=="",]
+pl = melt.data.table(pl, id.vars = "name", measure.vars = names(CNA_split))
+pl[, variable := factor(variable, levels=c("Primary", "Metastasis", "BM"))]
+
+gg = ggplot(pl, aes(x=name, y=value, fill=variable)) + ggtitle("Enhancer-Promoter region encompassing at least one CNA boundary", subtitle = "Threshold: at least one set with frequncy >= 10%; Gene expression (TPM) >= 1") + geom_bar(stat="identity", position = "dodge", col="black") + scale_fill_lancet(name="Dataset", alpha=0.75) + scale_x_discrete("Enhancer-regulated gene") + scale_y_continuous("CNA frequency across samples", labels = percent) + theme_pubr() + theme(axis.text.x = element_text(angle=45, hjust=1))
+ggsave(gg, filename = "EnhancerAtlas_CNAs_disrupting_EP.png", units = "in", width = 12, height = 6, dpi = 300)
+
+```
+
+
